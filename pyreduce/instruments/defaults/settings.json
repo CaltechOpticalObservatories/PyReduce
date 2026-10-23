@@ -86,6 +86,7 @@
     },
     "wavecal_init": {
         "degree": 2,
+        "wave_delta": 20,
         "atlas": "thar",
         "medium": "vac",
         "match_tolerance": 1.0,

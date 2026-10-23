@@ -917,10 +917,14 @@ class Curvature:
             compact[:, 1:, :] = fitted_coeffs
             fit_deg = self.fit_degree
         else:
-            # 2D mode: fitted_coeffs has shape (curve_degree, ...) - more complex
-            # For now, only store compact form for 1D mode
-            compact = None
-            fit_deg = None
+            fit_deg = self.fit_degree[0]
+            compact = np.zeros((self.n, self.curve_degree + 1, fit_deg + 1))
+            # The joint fit uses ascending powers of column and trace index.
+            # Contract its trace-index dimension, then reverse column powers
+            # for Trace.slit_at_x, which evaluates with np.polyval.
+            order_powers = np.arange(self.n)[:, None] ** np.arange(self.fit_degree[1] + 1)
+            per_trace = np.einsum("cxy,ty->tcx", fitted_coeffs, order_powers)
+            compact[:, 1:, :] = per_trace[:, :, ::-1]
 
         return {
             "coeffs": coeffs,
