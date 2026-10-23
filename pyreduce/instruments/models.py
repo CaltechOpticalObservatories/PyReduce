@@ -8,6 +8,7 @@ structure described in REDESIGN.md.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
@@ -85,7 +86,9 @@ class FiberGroupConfig(BaseModel):
     """
 
     range: tuple[int, int]  # [start, end) half-open interval, 1-based
-    merge: str | list[int] = "center"  # "average", "center", or [indices]
+    merge: str | list[int] = (
+        "center"  # "average", "center", "center_weight", or [indices]
+    )
     height: float | Literal["derived"] | None = None
 
     model_config = ConfigDict(extra="forbid")
@@ -104,7 +107,9 @@ class FiberBundleConfig(BaseModel):
 
     size: int  # expected fibers per bundle
     count: int | None = None  # number of bundles (validated if provided)
-    merge: str | list[int] = "center"  # "average", "center", or [indices]
+    merge: str | list[int] = (
+        "center"  # "average", "center", "center_weight", or [indices]
+    )
     height: str | float | None = "derived"  # "derived", explicit pixels, or None
 
     # Bundle centers for robust assignment (handles missing fibers)
@@ -161,6 +166,14 @@ class FibersConfig(BaseModel):
     order_centers: dict[int, float] | None = None  # inline (single channel only)
     order_centers_file: str | list[str] | None = None  # per-channel list supported
 
+    # Direction in which fiber_idx is numbered within each order/group:
+    #   "bottom_up" (default) -> fiber 1 = lowest-y trace
+    #   "top_down"            -> fiber 1 = highest-y trace
+    # Set this to match the frame your group/ring `range`s are written in.
+    # ANDES uses "top_down" so the ranges line up with the E2E simulator's
+    # fiber numbering (fiber 1 at the top of the slit).
+    numbering: Literal["top_down", "bottom_up"] = "bottom_up"
+
     model_config = ConfigDict(extra="forbid")
 
     @field_validator("order_centers", mode="before")
@@ -190,6 +203,26 @@ class FibersConfig(BaseModel):
                     "using auto-pairing mode (consecutive traces grouped by y-proximity)",
                     self.fibers_per_order,
                 )
+        return self
+
+    @model_validator(mode="after")
+    def validate_no_bundle_named_groups(self):
+        """Reject named groups whose names collide with bundle merge names.
+
+        Bundle merges produce group names of the form ``bundle_<int>``;
+        a named group with the same shape would create silent name
+        collisions in selection.
+        """
+        import re
+
+        if self.groups:
+            pat = re.compile(r"^bundle_\d+$")
+            for name in self.groups:
+                if pat.match(name):
+                    raise ValueError(
+                        f"Group name {name!r} collides with bundle merge "
+                        f"naming (bundle_<int>); pick a different name."
+                    )
         return self
 
 
@@ -303,6 +336,58 @@ class InstrumentConfig(BaseModel):
     def normalize_list_or_scalar(cls, v):
         """Keep as-is, validation handles both forms."""
         return v
+
+    @field_validator(
+        "id_instrument",
+        "id_bias",
+        "id_flat",
+        "id_curvature",
+        "id_scatter",
+        "id_orders",
+        "id_wave",
+        "id_comb",
+        "id_spec",
+        "id_channel",
+    )
+    @classmethod
+    def validate_id_pattern(cls, v, info):
+        """id_* values are compiled as regex by the file classification
+        filters, so a broken pattern must fail at config load, not mid-run."""
+        patterns = v if isinstance(v, list) else [v]
+        for pattern in patterns:
+            if pattern is None:
+                continue
+            try:
+                re.compile(pattern)
+            except re.error as e:
+                raise ValueError(
+                    f"{info.field_name}: invalid regex pattern {pattern!r} ({e})"
+                ) from e
+        return v
+
+    @model_validator(mode="after")
+    def validate_channel_indexed_lists(self):
+        """List-valued per-channel fields must line up with `channels`,
+        otherwise the getter silently indexes the wrong entry."""
+        list_fields = {}
+        for name in ("id_channel", "channels_id", "extension", "orientation"):
+            value = getattr(self, name)
+            if isinstance(value, list):
+                list_fields[name] = value
+        if not list_fields:
+            return self
+        if self.channels is None:
+            raise ValueError(
+                f"{sorted(list_fields)} are per-channel lists, "
+                "but 'channels' is not defined"
+            )
+        for name, value in list_fields.items():
+            if len(value) != len(self.channels):
+                raise ValueError(
+                    f"'{name}' has {len(value)} entries but 'channels' "
+                    f"has {len(self.channels)}: {self.channels}"
+                )
+        return self
 
 
 # Future models for the nested structure (REDESIGN.md)

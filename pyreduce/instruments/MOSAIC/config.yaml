@@ -10,9 +10,48 @@ telescope: ELT
 date: DATE-OBS
 date_format: fits
 
-# NIR channel and VIS quadrants (VIS1-VIS4)
-# VIS detector is a 4-quadrant mosaic, each quadrant processed separately
-channels: [NIR, VIS1, VIS2, VIS3, VIS4]
+# Channel naming follows the E2E `ESO INS MODE` header verbatim:
+#   NIR (one 4096x4096 detector per mode): J_LR, H_LR, H_HR
+#   VIS (each mode is a 12788x12394 four-detector mosaic): B_LR, B1_HR, B2_HR,
+#        R_LR, R1_HR, R2_HR -- each fanned out by detector quadrant LL/LR/UL/UR.
+# A VIS channel is <mode>_<quadrant>; the mode half selects files (kw_channel),
+# the quadrant half selects the crop (see MOSAIC.QUADRANTS in __init__.py).
+# The detectors are slightly misaligned with a non-uniform gap, so each quadrant
+# is reduced independently rather than tracing across the mosaic.
+channels:
+  - J_LR
+  - H_LR
+  - H_HR
+  - B_LR_LL
+  - B_LR_LR
+  - B_LR_UL
+  - B_LR_UR
+  - B1_HR_LL
+  - B1_HR_LR
+  - B1_HR_UL
+  - B1_HR_UR
+  - B2_HR_LL
+  - B2_HR_LR
+  - B2_HR_UL
+  - B2_HR_UR
+  - R_LR_LL
+  - R_LR_LR
+  - R_LR_UL
+  - R_LR_UR
+  - R1_HR_LL
+  - R1_HR_LR
+  - R1_HR_UL
+  - R1_HR_UR
+  - R2_HR_LL
+  - R2_HR_LR
+  - R2_HR_UL
+  - R2_HR_UR
+
+# Mode is carried in the header; used both to auto-select the channel and to
+# classify which files belong to a channel (the quadrant suffix is stripped).
+instrument_mode: "ESO INS MODE"
+kw_channel: "ESO INS MODE"
+
 extension: 0
 orientation: 0
 transpose: false
@@ -54,7 +93,10 @@ id_spec: ".*"
 fibers:
   bundles:
     size: 7
-    merge: center
+    # center_weight: inverse-distance weighted average of detected fibers
+    # around bundle_center, so a missing center fiber doesn't shift the
+    # merged y by one fiber slot.
+    merge: center_weight
     bundle_centers_file: bundle_centers_{channel}.yaml
   use:
     curvature: groups

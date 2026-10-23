@@ -22,10 +22,14 @@ from pyreduce.pipeline import Pipeline
 
 # --- Configuration ---
 instrument_name = "ANDES_YJH"
-channel = "J"  # Y, J, or H
+channel = "H"  # Y, J, or H
 data_dir = os.environ.get("REDUCE_DATA", os.path.expanduser("~/REDUCE_DATA"))
 raw_dir = os.path.join(data_dir, "ANDES", channel)
 output_dir = os.path.join(data_dir, "ANDES", "reduced", channel)
+# Optional suffix so parallel jobs can write to separate dirs
+_out_suffix = os.environ.get("PYREDUCE_OUTPUT_SUBDIR", "")
+if _out_suffix:
+    output_dir = os.path.join(output_dir, _out_suffix)
 
 # Input files (even and odd illuminated flats)
 # File selection is header-based:
@@ -35,11 +39,21 @@ output_dir = os.path.join(data_dir, "ANDES", "reduced", channel)
 file_even = os.path.join(raw_dir, f"{channel}_FF_even_1s.fits")
 file_odd = os.path.join(raw_dir, f"{channel}_FF_odd_1s.fits")
 
+# Combined LFC frame (all fibers) used for slit curvature determination
+curvature_file = os.path.join(
+    data_dir, "ANDES", "lfc_allfib_allbands", f"{channel}_LFC_combined_all.fits"
+)
+
 # Plot settings
 plot = int(os.environ.get("PYREDUCE_PLOT", "1"))
 
 # --- Create Pipeline ---
-config = load_config(None, instrument_name)
+config = load_config(None, instrument_name, channel=channel)
+# config["science"]["extraction_height"] = 4
+config["science"]["extraction_reject"] = 20
+_tr = os.environ.get("ANDES_TRACE_RANGE")
+trace_range = tuple(int(x) for x in _tr.split(",")) if _tr else None
+
 pipe = Pipeline(
     instrument=instrument_name,
     channel=channel,
@@ -47,6 +61,7 @@ pipe = Pipeline(
     target="ANDES_fiber_test",
     config=config,
     plot=plot,
+    trace_range=trace_range,
 )
 
 print(f"Instrument: {pipe.instrument.name}")
@@ -55,7 +70,8 @@ print(f"Per-order grouping: {fibers_config.per_order}")
 print(f"Groups: {list(fibers_config.groups.keys())}")
 
 # --- Trace or load from previous run ---
-LOAD_TRACE = True  # Set True to load traces from previous run
+LOAD_TRACE = True  # Set False to trace fresh from the flats
+LOAD_CURVE = False  # Set True to reuse curvature stored in the loaded traces
 
 if LOAD_TRACE:
     print("\nLoading traces from previous run...")
@@ -70,6 +86,15 @@ else:
     results = pipe.run()
     trace_objects = results["trace"]  # list[Trace]
     print(f"  Found {len(trace_objects)} traces")
+
+# --- Determine or load slit curvature ---
+if not LOAD_CURVE:
+    # Determine slit curvature from the combined LFC frame
+    print(f"\nDetermining slit curvature from {os.path.basename(curvature_file)}...")
+    pipe.curvature([curvature_file])
+    results = pipe.run()
+    trace_objects = results["trace"]  # traces updated in-place with curvature
+    print(f"  Curvature applied to {len(trace_objects)} traces")
 
 # Show trace info
 print("\nTraces:")
@@ -97,5 +122,9 @@ print(f"  Saved combined flat: {combined_file}")
 
 # --- Extract using the science step ---
 print("\nExtracting spectra (group A from fiber config)...")
-pipe.instrument.config.fibers.use["science"] = ["ring2"]
-pipe.extract([combined_file]).run()
+# pipe.use_fibers(["1", "75"], step="science")
+science_file = os.environ.get(
+    "ANDES_SCIENCE_FILE",
+    os.path.join(raw_dir, "H_ifu_HR1544_skyabs_skyemi_fp_20260314.fits"),
+)
+pipe.extract([science_file], use=["ring4"]).run()
