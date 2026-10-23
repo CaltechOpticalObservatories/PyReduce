@@ -20,8 +20,8 @@ fibers:
   use:
     # Per-channel selection (new syntax)
     science:
-      NIR: [sci_nir]
-      VIS1: [sci_vis]
+      J_LR: [sci_nir]
+      R1_HR_LL: [sci_vis]
       default: [sci_nir]  # fallback for unlisted channels
     # Same for all channels (existing syntax, unchanged)
     wavecal: [cal_nir, cal_vis]
@@ -53,12 +53,12 @@ def select_traces_for_step(
             selection = selection.get(channel, selection.get("default", "groups"))
 ```
 
-### 2. reduce.py - Update call sites
+### 2. steps/ - Update call sites
 
 Two locations need to pass `self.channel`:
 
-- Line ~366 (in `Step.get_traces_for_step`)
-- Line ~978 (in another step class)
+- `Step._select_traces` in `steps/base.py` (used by all steps)
+- `Trace.get_traces_for_step` in `steps/trace.py`
 
 ### 3. instruments/models.py - Update Pydantic model
 

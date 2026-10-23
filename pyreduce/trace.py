@@ -151,8 +151,10 @@ def _assign_order_and_fiber_inplace(
     order_centers: dict[int, float] | None,
     ncol: int,
     fibers_per_order: int | None = None,
+    bundle_centers: dict[int, float] | None = None,
+    top_down: bool = False,
 ) -> None:
-    """Assign m (order number) and fiber_idx to Trace objects.
+    """Assign m (order number), bundle, and fiber_idx to Trace objects.
 
     Parameters
     ----------
@@ -160,12 +162,23 @@ def _assign_order_and_fiber_inplace(
         Trace objects (modified in place)
     order_centers : dict[int, float] | None
         Order number -> y-position mapping. If None, m stays None
-        (unless fibers_per_order is set for auto-pairing).
+        (unless fibers_per_order is set for auto-pairing or bundle_centers
+        is provided alone, in which case the sequential-m fallback is
+        skipped because each trace is one fiber within a bundle, not its
+        own order).
     ncol : int
         Number of columns in detector
     fibers_per_order : int or None
         If set and order_centers is None, group every N consecutive traces
         (sorted by y-position) into the same order with sequential fiber_idx.
+    bundle_centers : dict[int, float] | None
+        Bundle id -> y-position mapping. When set, each trace is matched
+        to the nearest bundle center; t.bundle is populated. fiber_idx is
+        then re-assigned within each (m, bundle).
+    top_down : bool
+        If True, fiber_idx 1 is the highest-y trace in each order/group;
+        if False (default), fiber_idx 1 is the lowest-y trace. Driven by
+        the instrument's ``fibers.numbering`` config.
     """
     if not traces:
         return
@@ -190,9 +203,10 @@ def _assign_order_and_fiber_inplace(
         for i, t in enumerate(traces):
             traces_by_m[t.m].append((i, y_positions[i]))
 
-        # Assign fiber_idx: sort by y within each order, then 1, 2, 3...
+        # Assign fiber_idx by y within each order. Direction follows the
+        # instrument's fibers.numbering (top_down -> fiber 1 = highest y).
         for _m, trace_list in traces_by_m.items():
-            trace_list.sort(key=lambda x: x[1])
+            trace_list.sort(key=lambda x: x[1], reverse=top_down)
             for fiber_idx, (trace_idx, _y) in enumerate(trace_list, start=1):
                 traces[trace_idx].fiber_idx = fiber_idx
 
@@ -207,7 +221,8 @@ def _assign_order_and_fiber_inplace(
         order_num = 0
         paired_set = set()
         for group in pair_indices:
-            for fiber_idx, trace_idx in enumerate(group, start=1):
+            ordered = sorted(group, key=lambda ti: y_pos[ti], reverse=top_down)
+            for fiber_idx, trace_idx in enumerate(ordered, start=1):
                 traces[trace_idx].m = order_num
                 traces[trace_idx].fiber_idx = fiber_idx
                 paired_set.add(trace_idx)
@@ -227,18 +242,40 @@ def _assign_order_and_fiber_inplace(
             order_num,
             fibers_per_order,
         )
-    else:
-        # No order_centers and no fibers_per_order: assign sequential m and
-        # fiber_idx=1 to all traces (one fiber per order).
+    elif bundle_centers is None:
+        # No order_centers, no fibers_per_order, no bundle_centers: assign
+        # sequential m and fiber_idx=1 to all traces (one fiber per order).
         traces.sort(key=lambda t: t.y_at_x(x_center))
         for i, t in enumerate(traces):
             t.m = i
             t.fiber_idx = 1
+    # else: bundle_centers handles assignment below; m stays None.
 
-    # Sort traces by (m descending, fiber_idx)
+    # Bundle assignment: independent of m, populates t.bundle and
+    # re-derives fiber_idx within each (m, bundle).
+    if bundle_centers is not None:
+        from collections import defaultdict
+
+        bundle_ids = np.array(list(bundle_centers.keys()))
+        bundle_ys = np.array([bundle_centers[b] for b in bundle_ids])
+
+        for i, y in enumerate(y_positions):
+            closest = int(np.argmin(np.abs(y - bundle_ys)))
+            traces[i].bundle = int(bundle_ids[closest])
+
+        traces_by_mb = defaultdict(list)
+        for i, t in enumerate(traces):
+            traces_by_mb[(t.m, t.bundle)].append((i, y_positions[i]))
+        for _key, trace_list in traces_by_mb.items():
+            trace_list.sort(key=lambda x: x[1], reverse=top_down)
+            for fiber_idx, (trace_idx, _y) in enumerate(trace_list, start=1):
+                traces[trace_idx].fiber_idx = fiber_idx
+
+    # Sort traces by (m descending, bundle, fiber_idx)
     def sort_key(t):
         m_val = t.m if t.m is not None else float("inf")
-        return (-m_val, t.fiber_idx or 0)
+        b_val = t.bundle if t.bundle is not None else 0
+        return (-m_val, b_val, t.fiber_idx or 0)
 
     traces.sort(key=sort_key)
 
@@ -246,6 +283,14 @@ def _assign_order_and_fiber_inplace(
     if order_centers is not None:
         unique_m = {t.m for t in traces if t.m is not None}
         logger.info("  Order numbers (m): %s", sorted(unique_m, reverse=True))
+    if bundle_centers is not None:
+        unique_b = {t.bundle for t in traces if t.bundle is not None}
+        logger.info(
+            "  Bundle ids: %d unique (range %d..%d)",
+            len(unique_b),
+            min(unique_b),
+            max(unique_b),
+        )
 
 
 def _compute_heights_inplace(traces: list, ncol: int) -> None:
@@ -734,6 +779,7 @@ def trace(
     noise=0,
     noise_relative=0,
     degree=4,
+    max_error=None,
     border_width=None,
     degree_before_merge=2,
     regularization=0,
@@ -748,6 +794,8 @@ def trace(
     debug_dir=None,
     order_centers: dict[int, float] | None = None,
     fibers_per_order: int | None = None,
+    bundle_centers: dict[int, float] | None = None,
+    top_down: bool = False,
 ):
     """Identify and trace orders, returning Trace objects.
 
@@ -773,6 +821,12 @@ def trace(
         If both noise and noise_relative are 0, defaults to 0.001 (0.1%).
     degree : int, optional
         polynomial degree of the order fit (default: 4)
+    max_error : float, optional
+        Maximum RMS (in pixels) of the final polynomial fit to a cluster.
+        Clusters whose fit residual exceeds this are discarded. This rejects
+        clusters that span two separate orders fused into one (their single
+        polynomial cannot follow both, so the RMS is large). Disabled if None
+        (default).
     border_width : int or list of 4 int, optional
         Pixels to ignore at image edges for order tracing.
         If int, same value applied to all edges.
@@ -792,6 +846,9 @@ def trace(
         consecutive traces (sorted by y) are grouped into orders of this size.
         Used for instruments like HARPSpol where a Wollaston prism splits each
         order into multiple beams.
+    top_down : bool, optional
+        If True, fiber_idx 1 is the highest-y trace within each order/group
+        (default False = lowest-y). Set from ``fibers.numbering``.
 
     Returns
     -------
@@ -861,7 +918,9 @@ def trace(
     if min_width == 0:
         pass
     elif isinstance(min_width, (float, np.floating)):
-        min_width = int(min_width * im.shape[0])
+        # A fraction of the dispersion length: min_width is compared against a
+        # cluster's extent in x, so it scales with ncol, not nrow
+        min_width = int(min_width * im.shape[1])
 
     # Validate filter_type
     valid_filters = ("boxcar", "gaussian", "whittaker")
@@ -1144,6 +1203,29 @@ def trace(
     logger.info("Fitting polynomials to %d clusters", len(x))
     traces_dict = fit_polynomials_to_clusters(x, y, n, degree)
 
+    # Reject clusters whose fit is too poor. A cluster that accidentally spans
+    # two separate orders cannot be followed by a single polynomial, so its
+    # residual RMS is large (~half the order separation) compared to a genuine
+    # trace (sub-pixel). x[c] are row positions, y[c] columns; the fit maps
+    # column -> row, so the residual is a cross-dispersion distance in pixels.
+    if max_error is not None:
+        rms = {
+            c: np.sqrt(np.mean((x[c] - np.polyval(traces_dict[c], y[c])) ** 2))
+            for c in traces_dict
+        }
+        too_large = [c for c, e in rms.items() if e > max_error]
+        for c in too_large:
+            del x[c], y[c], traces_dict[c]
+        n = list(x.keys())
+        if too_large:
+            logger.info(
+                "Removed %d clusters with fit RMS > max_error=%g px "
+                "(likely two orders fused into one), %d remain",
+                len(too_large),
+                max_error,
+                len(x),
+            )
+
     # Sort traces from bottom to top, using relative position
     def compare(i, j):
         _, xi, i_left, i_right = i
@@ -1173,9 +1255,14 @@ def trace(
     # Compute extraction heights based on trace spacing
     _compute_heights_inplace(trace_objects, im.shape[1])
 
-    # Assign order numbers and fiber indices
+    # Assign order numbers, bundles, and fiber indices
     _assign_order_and_fiber_inplace(
-        trace_objects, order_centers, im.shape[1], fibers_per_order=fibers_per_order
+        trace_objects,
+        order_centers,
+        im.shape[1],
+        fibers_per_order=fibers_per_order,
+        bundle_centers=bundle_centers,
+        top_down=top_down,
     )
 
     if plot:  # pragma: no cover
@@ -1282,6 +1369,7 @@ def group_fibers(
     traces: list[TraceData],
     fibers_config,
     degree: int = 4,
+    bundle_centers: dict[int, float] | None = None,
 ) -> list[TraceData]:
     """Merge individual fiber traces into groups according to config.
 
@@ -1337,12 +1425,14 @@ def group_fibers(
         # Named groups with explicit ranges
         for group_name, group_cfg in fibers_config.groups.items():
             start, end = group_cfg.range
-            start_idx = start - 1  # Convert to 0-based
+            start_idx = max(start - 1, 0)  # Convert to 0-based
             end_idx = end - 1  # Half-open, end is exclusive
 
             for m, order_traces in sorted(traces_by_m.items()):
-                # Select fibers in range for this order
-                if end_idx > len(order_traces):
+                # Clamp per order: an incomplete order must not truncate
+                # the range for subsequent (complete) orders
+                order_end = end_idx
+                if order_end > len(order_traces):
                     logger.warning(
                         "Group %s range [%d, %d) exceeds fiber count %d in order %s",
                         group_name,
@@ -1351,13 +1441,12 @@ def group_fibers(
                         len(order_traces),
                         m,
                     )
-                    end_idx = min(end_idx, len(order_traces))
-                start_idx = max(start_idx, 0)
+                    order_end = len(order_traces)
 
-                if start_idx >= end_idx:
+                if start_idx >= order_end:
                     continue
 
-                selected = order_traces[start_idx:end_idx]
+                selected = order_traces[start_idx:order_end]
                 merged = _merge_trace_objects(selected, group_cfg.merge, degree)
 
                 if merged is not None:
@@ -1375,46 +1464,71 @@ def group_fibers(
                         )
                     )
 
-    elif fibers_config.bundles is not None:
+    # Bundles run in addition to (not instead of) named groups: a single
+    # input fiber can feed both a named-group merge AND a bundle merge,
+    # producing two distinct output traces with different `group` slots.
+    if fibers_config.bundles is not None:
         bundle_cfg = fibers_config.bundles
         bundle_size = bundle_cfg.size
 
-        for m, order_traces in sorted(traces_by_m.items()):
-            n_in_order = len(order_traces)
-            if n_in_order == 0:
-                continue
+        # Group traces by (m, bundle). Each group's fibers are merged
+        # into one Trace named "bundle_{bundle_id}". `m` and `bundle` are
+        # independent fields: a multi-order bundled instrument has one
+        # merged trace per (m, bundle), and the same bundle name repeats
+        # across orders (uniqueness is on (m, bundle, group)).
+        traces_by_mb = defaultdict(list)
+        for t in traces:
+            traces_by_mb[(t.m, t.bundle)].append(t)
+        for key in traces_by_mb:
+            traces_by_mb[key].sort(key=lambda t: t.fiber_idx if t.fiber_idx else 0)
 
-            # Check divisibility
-            if n_in_order % bundle_size != 0:
+        for (m, bundle), members in sorted(
+            traces_by_mb.items(),
+            key=lambda kv: (
+                kv[0][0] if kv[0][0] is not None else float("inf"),
+                kv[0][1] if kv[0][1] is not None else 0,
+            ),
+        ):
+            if not members:
+                continue
+            if bundle is None:
                 logger.warning(
-                    "Order %s has %d fibers, not divisible by bundle size %d",
+                    "Order %s has %d fibers but no bundle assignment; "
+                    "skipping. Configure bundle_centers_file or set "
+                    "Trace.bundle manually.",
                     m,
-                    n_in_order,
+                    len(members),
+                )
+                continue
+            if len(members) != bundle_size:
+                logger.warning(
+                    "Order %s bundle %s has %d fibers, expected %d",
+                    m,
+                    bundle,
+                    len(members),
                     bundle_size,
                 )
 
-            n_bundles = (n_in_order + bundle_size - 1) // bundle_size
-            for i in range(n_bundles):
-                bundle_name = f"bundle_{i + 1}"
-                start_idx = i * bundle_size
-                end_idx = min((i + 1) * bundle_size, n_in_order)
-
-                selected = order_traces[start_idx:end_idx]
-                merged = _merge_trace_objects(selected, bundle_cfg.merge, degree)
-
-                if merged is not None:
-                    height = _compute_group_height_from_traces(selected, bundle_cfg)
-
-                    result.append(
-                        TraceData(
-                            m=m,
-                            group=bundle_name,
-                            fiber_idx=None,
-                            pos=merged.pos,
-                            column_range=merged.column_range,
-                            height=height,
-                        )
-                    )
+            bundle_center_y = (
+                bundle_centers.get(bundle) if bundle_centers is not None else None
+            )
+            merged = _merge_trace_objects(
+                members, bundle_cfg.merge, degree, bundle_center=bundle_center_y
+            )
+            if merged is None:
+                continue
+            height = _compute_group_height_from_traces(members, bundle_cfg)
+            result.append(
+                TraceData(
+                    m=m,
+                    bundle=bundle,
+                    group=f"bundle_{bundle}",
+                    fiber_idx=None,
+                    pos=merged.pos,
+                    column_range=merged.column_range,
+                    height=height,
+                )
+            )
 
     # Sort by (m descending, group)
     def sort_key(t):
@@ -1431,6 +1545,7 @@ def _merge_trace_objects(
     traces: list[TraceData],
     merge_method: str | list[int],
     degree: int,
+    bundle_center: float | None = None,
 ) -> TraceData | None:
     """Merge multiple traces into one according to merge method.
 
@@ -1439,9 +1554,15 @@ def _merge_trace_objects(
     traces : list[Trace]
         Traces to merge (must have same m)
     merge_method : str or list[int]
-        "average", "center", or list of 1-based indices
+        "center", "center_weight", "average", or list of 1-based indices.
+        "center_weight" needs ``bundle_center`` and inverse-distance-weights
+        every member trace against it, so a missing center fiber doesn't
+        shift the merged y by a fiber slot.
     degree : int
         Polynomial degree for refitting
+    bundle_center : float, optional
+        Reference y at the detector midpoint for this bundle. Required for
+        ``merge_method == "center_weight"``.
 
     Returns
     -------
@@ -1465,6 +1586,32 @@ def _merge_trace_objects(
         return TraceData(
             m=traces[idx].m,
             pos=traces[idx].pos,
+            column_range=(col_min, col_max),
+        )
+
+    elif merge_method == "center_weight":
+        if bundle_center is None:
+            raise ValueError(
+                "merge='center_weight' requires bundle_centers to be configured"
+            )
+        # Weight each detected fiber by 1 / |y - bundle_center| at the
+        # detector midpoint, then blend their full polynomials with those
+        # fixed weights. Symmetric flanks cancel; a present center fiber
+        # dominates; a missing center collapses to the symmetric mean.
+        x_mid = (col_min + col_max) / 2
+        eps = 0.1  # px; avoids div-by-zero on a perfect-match fiber
+        weights = np.array(
+            [1.0 / max(abs(t.y_at_x(x_mid) - bundle_center), eps) for t in traces]
+        )
+        weights /= weights.sum()
+        x_eval = np.arange(col_min, col_max)
+        y_values = np.array([t.y_at_x(x_eval) for t in traces])
+        y_mean = (weights[:, None] * y_values).sum(axis=0)
+        fit = Polynomial.fit(x_eval, y_mean, deg=degree, domain=[])
+        coeffs = fit.coef[::-1]
+        return TraceData(
+            m=traces[0].m,
+            pos=coeffs,
             column_range=(col_min, col_max),
         )
 

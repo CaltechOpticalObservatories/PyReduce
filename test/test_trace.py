@@ -431,6 +431,40 @@ class TestSelectTracesForStep:
         assert len(result["A"]) == 2  # 2 orders with fiber A
 
     @pytest.mark.unit
+    def test_select_bundle_across_orders(self):
+        """Selecting "bundle_1" must return all orders' bundle_1 traces.
+
+        This is the bundled-echelle case: m and bundle are independent,
+        so the same bundle name appears once per order.
+        """
+        from pyreduce.instruments.models import FiberBundleConfig, FibersConfig
+        from pyreduce.trace_model import Trace
+
+        traces = [
+            Trace(
+                m=m,
+                bundle=b,
+                group=f"bundle_{b}",
+                pos=np.array([0.0, 0.0, 1000.0 * m + 10.0 * b]),
+                column_range=(10, 990),
+            )
+            for m in (10, 11, 12)
+            for b in (1, 2)
+        ]
+
+        config = FibersConfig(
+            bundles=FiberBundleConfig(size=2, merge="center"),
+            use={"science": ["bundle_1"]},
+        )
+
+        result = trace.select_traces_for_step(traces, config, "science")
+
+        assert "bundle_1" in result
+        assert len(result["bundle_1"]) == 3  # one per order
+        assert {t.m for t in result["bundle_1"]} == {10, 11, 12}
+        assert all(t.bundle == 1 for t in result["bundle_1"])
+
+    @pytest.mark.unit
     def test_select_traces_with_height(self):
         """Test that Trace objects preserve height information."""
         from pyreduce.instruments.models import FiberGroupConfig, FibersConfig
@@ -456,6 +490,125 @@ class TestSelectTracesForStep:
         assert "A" in result
         assert len(result["A"]) == 1
         assert result["A"][0].height == 42.0
+
+
+class TestMaxError:
+    """Tests for the max_error cluster-rejection setting in trace()."""
+
+    @pytest.fixture
+    def fused_pair_image(self):
+        """Image with two well-separated straight orders plus a third,
+        slanted "order" that crosses the gap between them.
+
+        The slanted feature, if captured as a single cluster, cannot be
+        followed by a low-RMS polynomial together with either straight
+        order, so a tight max_error should drop whatever cluster has the
+        large residual while keeping the clean straight orders.
+        """
+        nrow, ncol = 200, 400
+        im = np.full((nrow, ncol), 1000.0)
+        # Two clean horizontal orders
+        for row in range(48, 53):
+            im[row, :] = 1300.0
+        for row in range(148, 153):
+            im[row, :] = 1300.0
+        return im
+
+    @pytest.mark.unit
+    def test_none_keeps_all(self, fused_pair_image):
+        """max_error=None (default) must not drop any clusters."""
+        traces = trace.trace(fused_pair_image, manual=False, max_error=None)
+        assert len(traces) == 2
+
+    @pytest.mark.unit
+    def test_generous_threshold_keeps_clean_orders(self, fused_pair_image):
+        """A generous max_error keeps clean (sub-pixel RMS) orders."""
+        traces = trace.trace(fused_pair_image, manual=False, max_error=5.0)
+        assert len(traces) == 2
+
+    @pytest.mark.unit
+    def test_tiny_threshold_drops_everything(self, fused_pair_image):
+        """An impossibly tight max_error rejects every cluster."""
+        traces = trace.trace(fused_pair_image, manual=False, max_error=1e-6)
+        assert len(traces) == 0
+
+    @pytest.mark.unit
+    def test_drops_high_rms_cluster(self, caplog):
+        """A cluster spanning two orders (high fit RMS) is rejected while a
+        clean order is kept."""
+        import logging
+
+        nrow, ncol = 200, 400
+        im = np.full((nrow, ncol), 1000.0)
+        # One clean order near row 40
+        for row in range(38, 43):
+            im[row, :] = 1300.0
+        # A thick block spanning rows 120..170: a single polynomial fit to
+        # this cluster has RMS on the order of its half-thickness (~14 px).
+        im[120:171, :] = 1300.0
+
+        caplog.set_level(logging.INFO)
+        # min_cluster small so both survive size filtering; min_width off.
+        traces_all = trace.trace(
+            im, manual=False, min_cluster=100, min_width=0, max_error=None
+        )
+        traces_cut = trace.trace(
+            im, manual=False, min_cluster=100, min_width=0, max_error=3.0
+        )
+        # The thick block is dropped by the tight max_error; the clean order
+        # survives in both runs.
+        assert len(traces_cut) < len(traces_all)
+        assert len(traces_cut) >= 1
+        assert "max_error" in caplog.text
+
+    @pytest.mark.unit
+    def test_fused_adjacent_orders_dropped(self):
+        """The real MOSAIC case: two adjacent orders whose gap closes at one
+        edge get merged into a single cluster. That fused cluster has a large
+        fit RMS and must be dropped, while a separate clean order survives."""
+        nrow, ncol = 120, 400
+        im = np.full((nrow, ncol), 1000.0)
+        # A clean, well-isolated order near the bottom.
+        im[20:24, :] = 1300.0
+        # Two nearby orders that start apart on the left and converge until
+        # they touch on the right, so the clustering fuses them into one
+        # V-shaped blob no single polynomial can follow.
+        for col in range(ncol):
+            gap = int(round(20 * (1 - col / (ncol - 1))))  # 20 px -> 0 px
+            top = 70
+            im[top : top + 3, col] = 1300.0
+            im[top + gap : top + gap + 3, col] = 1300.0
+
+        traces_all = trace.trace(im, manual=False, min_cluster=100, min_width=0)
+        traces_cut = trace.trace(
+            im, manual=False, min_cluster=100, min_width=0, max_error=2.0
+        )
+        # The fused blob is rejected, the clean isolated order is kept.
+        assert len(traces_cut) < len(traces_all)
+        assert len(traces_cut) >= 1
+
+    @pytest.mark.unit
+    def test_trace_step_reads_max_error_from_config(self):
+        """The reduce.Trace step picks up max_error from its config and
+        defaults to None when the key is absent."""
+        from pyreduce import configuration
+        from pyreduce.reduce import Trace
+
+        config = configuration.load_config(None, "UVES", 0)["trace"]
+        step_kwargs = {
+            "instrument": "UVES",
+            "channel": "middle",
+            "target": "",
+            "night": "",
+            "output_dir": "",
+            "trace_range": None,
+        }
+
+        config["max_error"] = 1.5
+        assert Trace(**step_kwargs, **config).max_error == 1.5
+
+        del config["max_error"]
+        assert Trace(**step_kwargs, **config).max_error is None
 
 
 class TestNoiseThreshold:
@@ -857,29 +1010,264 @@ class TestGroupFibers:
             assert t.fiber_idx is None
 
     @pytest.mark.unit
-    def test_group_fibers_bundles(self):
-        """Test group_fibers with bundles config."""
-        from pyreduce.instruments.models import FiberBundleConfig, FibersConfig
+    def test_group_fibers_incomplete_order_does_not_truncate_later_orders(self):
+        """A missing fiber in one order must not shrink the group range
+        for subsequent (complete) orders."""
+        from pyreduce.instruments.models import FiberGroupConfig, FibersConfig
         from pyreduce.trace_model import Trace as TraceData
 
-        # 4 traces in one order, 2 fibers per bundle
+        # Order 90 (processed first) has only 2 of 3 fibers detected;
+        # order 91 has all 3.
         traces = [
             TraceData(
                 m=90,
-                fiber_idx=i,
-                pos=np.array([0.0, 0.0, 100.0 + i * 10]),
+                fiber_idx=1,
+                pos=np.array([0.0, 0.0, 100.0]),
+                column_range=(10, 990),
+            ),
+            TraceData(
+                m=90,
+                fiber_idx=2,
+                pos=np.array([0.0, 0.0, 120.0]),
+                column_range=(10, 990),
+            ),
+            TraceData(
+                m=91,
+                fiber_idx=1,
+                pos=np.array([0.0, 0.0, 200.0]),
+                column_range=(10, 990),
+            ),
+            TraceData(
+                m=91,
+                fiber_idx=2,
+                pos=np.array([0.0, 0.0, 220.0]),
+                column_range=(10, 990),
+            ),
+            TraceData(
+                m=91,
+                fiber_idx=3,
+                pos=np.array([0.0, 0.0, 240.0]),
+                column_range=(10, 990),
+            ),
+        ]
+
+        config = FibersConfig(
+            groups={"A": FiberGroupConfig(range=(1, 4), merge="average")}
+        )
+        result = trace.group_fibers(traces, config)
+
+        assert len(result) == 2
+        by_m = {t.m: t for t in result}
+        # Order 90: average of the 2 detected fibers
+        assert by_m[90].y_at_x(500) == pytest.approx(110.0, abs=1.0)
+        # Order 91: average of all 3 fibers, not truncated to the first 2
+        assert by_m[91].y_at_x(500) == pytest.approx(220.0, abs=1.0)
+
+    @pytest.mark.unit
+    def test_group_fibers_bundles_within_order(self):
+        """Bundles inside a single echelle order m=90.
+
+        4 fibers split into 2 bundles of 2 — bundle is preset on input
+        traces (the trace step assigns it from bundle_centers). Group
+        names are derived from `bundle`, never from `m`.
+        """
+        from pyreduce.instruments.models import FiberBundleConfig, FibersConfig
+        from pyreduce.trace_model import Trace as TraceData
+
+        traces = [
+            TraceData(
+                m=90,
+                bundle=b,
+                fiber_idx=fi,
+                pos=np.array([0.0, 0.0, 100.0 + 10 * (2 * (b - 1) + fi - 1)]),
                 column_range=(10, 990),
             )
-            for i in range(1, 5)
+            for b in (1, 2)
+            for fi in (1, 2)
         ]
 
         config = FibersConfig(bundles=FiberBundleConfig(size=2, merge="center"))
+        result = trace.group_fibers(traces, config)
+
+        assert len(result) == 2
+        groups = {t.group for t in result}
+        assert groups == {"bundle_1", "bundle_2"}
+        # m and bundle preserved on merged traces; bundle drives the name
+        for t in result:
+            assert t.m == 90
+            assert t.fiber_idx is None
+            assert t.group == f"bundle_{t.bundle}"
+
+    def test_group_fibers_bundles_single_order(self):
+        """Single-order MOSAIC-style: m=1 always, bundle varies.
+
+        Regression test for the naming bug: when each output bundle was
+        the only bundle in its order (the bundle-centers path), every
+        merged trace was named "bundle_1". With m and bundle independent,
+        m=1 stays constant and the name comes from bundle.
+        """
+        from pyreduce.instruments.models import FiberBundleConfig, FibersConfig
+        from pyreduce.trace_model import Trace as TraceData
+
+        # 3 bundles of 2 fibers each, all in m=1
+        traces = [
+            TraceData(
+                m=1,
+                bundle=b,
+                fiber_idx=fi,
+                pos=np.array([0.0, 0.0, 100.0 * b + fi]),
+                column_range=(10, 990),
+            )
+            for b in (1, 2, 3)
+            for fi in (1, 2)
+        ]
+
+        config = FibersConfig(bundles=FiberBundleConfig(size=2, merge="center"))
+        result = trace.group_fibers(traces, config)
+
+        assert len(result) == 3
+        groups = {t.group for t in result}
+        assert groups == {"bundle_1", "bundle_2", "bundle_3"}
+        for t in result:
+            assert t.m == 1
+            assert t.group == f"bundle_{t.bundle}"
+
+    @pytest.mark.unit
+    def test_group_fibers_bundles_center_weight(self):
+        """center_weight: merged y collapses to bundle_center regardless of which fibers detected.
+
+        Three scenarios with a 7-slot bundle at center y=100, fiber step 7.57:
+        - all 7 detected: closest-to-center weight dominates -> y ~= 100
+        - center (slot 4) missing: symmetric flanks average to ~100
+        - center + slot 3 missing: still ~100 within ~3 px (the corner-case
+          bias we showed in discussion)
+        """
+        from pyreduce.instruments.models import FiberBundleConfig, FibersConfig
+        from pyreduce.trace_model import Trace as TraceData
+
+        bundle_center = 100.0
+        fiber_step = 7.57
+
+        def make_traces(slots):
+            return [
+                TraceData(
+                    m=1,
+                    bundle=1,
+                    fiber_idx=fi,
+                    pos=np.array([0.0, 0.0, bundle_center + (s - 4) * fiber_step]),
+                    column_range=(10, 990),
+                )
+                for fi, s in enumerate(slots, start=1)
+            ]
+
+        config = FibersConfig(bundles=FiberBundleConfig(size=7, merge="center_weight"))
+
+        # All 7 detected
+        traces_all = make_traces([1, 2, 3, 4, 5, 6, 7])
+        r = trace.group_fibers(traces_all, config, bundle_centers={1: bundle_center})
+        assert len(r) == 1
+        # y at midpoint
+        x_mid = (r[0].column_range[0] + r[0].column_range[1]) / 2
+        assert r[0].y_at_x(x_mid) == pytest.approx(bundle_center, abs=0.2)
+
+        # Center (slot 4) missing -> symmetric flanks
+        traces_no_center = make_traces([1, 2, 3, 5, 6, 7])
+        r = trace.group_fibers(
+            traces_no_center, config, bundle_centers={1: bundle_center}
+        )
+        assert r[0].y_at_x(x_mid) == pytest.approx(bundle_center, abs=0.5)
+
+        # Center + adjacent missing: asymmetric, larger but bounded bias
+        traces_corner = make_traces([1, 2, 5, 6, 7])
+        r = trace.group_fibers(traces_corner, config, bundle_centers={1: bundle_center})
+        # the corner case has ~0.4 * fiber_step bias by analysis
+        assert abs(r[0].y_at_x(x_mid) - bundle_center) < fiber_step
+
+    def test_group_fibers_groups_and_bundles_together(self):
+        """Both 'groups' and 'bundles' configured: produce both kinds of merges.
+
+        A trace can't simultaneously be a named-group merge AND a bundle
+        merge (group is a single slot), but the same fibers can feed
+        into multiple merged output traces. Result must contain both:
+        named-group merges ("A", "B") and bundle merges ("bundle_1",
+        "bundle_2").
+        """
+        from pyreduce.instruments.models import (
+            FiberBundleConfig,
+            FiberGroupConfig,
+            FibersConfig,
+        )
+        from pyreduce.trace_model import Trace as TraceData
+
+        # 4 fibers in m=10, split as bundle 1 = fibers 1-2, bundle 2 = 3-4
+        traces = [
+            TraceData(
+                m=10,
+                bundle=(fi - 1) // 2 + 1,
+                fiber_idx=fi,
+                pos=np.array([0.0, 0.0, 100.0 + 5 * fi]),
+                column_range=(10, 990),
+            )
+            for fi in (1, 2, 3, 4)
+        ]
+
+        # Named groups: A = fibers 1-2, B = fibers 3-4 (within m=10)
+        config = FibersConfig(
+            groups={
+                "A": FiberGroupConfig(range=(1, 3)),  # half-open
+                "B": FiberGroupConfig(range=(3, 5)),
+            },
+            bundles=FiberBundleConfig(size=2, merge="center"),
+        )
 
         result = trace.group_fibers(traces, config)
 
-        # Should have 2 bundles
         groups = {t.group for t in result}
-        assert groups == {"bundle_1", "bundle_2"}
+        # 2 named-group merges + 2 bundle merges = 4 total
+        assert "A" in groups
+        assert "B" in groups
+        assert "bundle_1" in groups
+        assert "bundle_2" in groups
+        assert len(result) == 4
+
+    def test_group_fibers_bundles_multi_order(self):
+        """Bundled echelle: multiple orders × multiple bundles.
+
+        Each merged trace has its own (m, bundle) pair. Group names
+        repeat across orders (bundle_1 exists in m=10 and m=11), which
+        is allowed: uniqueness is on (m, bundle, group).
+        """
+        from pyreduce.instruments.models import FiberBundleConfig, FibersConfig
+        from pyreduce.trace_model import Trace as TraceData
+
+        # 2 orders × 2 bundles × 2 fibers = 8 traces
+        traces = [
+            TraceData(
+                m=m,
+                bundle=b,
+                fiber_idx=fi,
+                pos=np.array([0.0, 0.0, 1000.0 * m + 10.0 * b + fi]),
+                column_range=(10, 990),
+            )
+            for m in (10, 11)
+            for b in (1, 2)
+            for fi in (1, 2)
+        ]
+
+        config = FibersConfig(bundles=FiberBundleConfig(size=2, merge="center"))
+        result = trace.group_fibers(traces, config)
+
+        assert len(result) == 4  # 2 orders × 2 bundles
+        # bundle_1 appears once per order
+        bundle1 = [t for t in result if t.group == "bundle_1"]
+        assert {t.m for t in bundle1} == {10, 11}
+        # Within each m, bundle_1 and bundle_2 both present
+        for m in (10, 11):
+            in_m = [t for t in result if t.m == m]
+            assert {t.group for t in in_m} == {"bundle_1", "bundle_2"}
+            # bundle attribute matches name
+            for t in in_m:
+                assert t.group == f"bundle_{t.bundle}"
 
 
 class TestGroupedPlusRawTraces:

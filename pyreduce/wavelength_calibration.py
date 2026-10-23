@@ -259,7 +259,11 @@ class LineList:
                 ),  # Not used. Describes the shape used to approximate the line. "G" for Gaussian
                 (("width", "WIDTH"), ">f8"),  # width of the line in pixels
                 (("height", "HEIGHT"), ">f8"),  # relative strength of the line
-                (("order", "ORDER"), ">i2"),  # echelle order the line is found in
+                (("order", "ORDER"), ">i2"),  # row index in the wavecal spectrum
+                (
+                    ("bundle", "BUNDLE"),
+                    ">i2",
+                ),  # bundle id (single-order multi-bundle), -1 if not bundled
                 ("flag", "?"),  # flag that tells us if we should use the line or not
             ],
         )
@@ -284,11 +288,24 @@ class LineList:
     @classmethod
     def load(cls, filename):
         data = np.load(filename, allow_pickle=True)
-        linelist = cls(data["cs_lines"])
+        linelist = cls(cls._coerce_dtype(data["cs_lines"]))
         # Load obase if present
         if "obase" in data:
             linelist.obase = int(data["obase"])
         return linelist
+
+    @classmethod
+    def _coerce_dtype(cls, lines):
+        # Legacy linelists predate the BUNDLE field; migrate so runtime-created
+        # lines (which always carry it) can be appended without a dtype clash.
+        if lines.dtype == cls.dtype:
+            return lines
+        out = np.empty(len(lines), dtype=cls.dtype)
+        for name in lines.dtype.names:
+            out[name] = lines[name]
+        if "BUNDLE" not in (lines.dtype.names or ()):
+            out["BUNDLE"] = -1
+        return out
 
     def save(self, filename):
         if self.obase is not None:
@@ -301,16 +318,20 @@ class LineList:
             linelist = linelist.data
         self.data = np.append(self.data, linelist)
 
-    def add_line(self, wave, order, pos, width, height, flag):
-        lines = self.from_list([wave], [order], [pos], [width], [height], [flag])
+    def add_line(self, wave, order, pos, width, height, flag, bundle=-1):
+        lines = self.from_list(
+            [wave], [order], [pos], [width], [height], [flag], bundle=[bundle]
+        )
         self.data = np.append(self.data, lines)
 
     @classmethod
-    def from_list(cls, wave, order, pos, width, height, flag):
+    def from_list(cls, wave, order, pos, width, height, flag, bundle=None):
+        if bundle is None:
+            bundle = [-1] * len(wave)
         lines = [
-            (w, w, p, p, p - wi / 2, p + wi / 2, b"G", wi, h, o, f)
-            for w, o, p, wi, h, f in zip(
-                wave, order, pos, width, height, flag, strict=False
+            (w, w, p, p, p - wi / 2, p + wi / 2, b"G", wi, h, o, b, f)
+            for w, o, p, wi, h, b, f in zip(
+                wave, order, pos, width, height, bundle, flag, strict=False
             )
         ]
         lines = np.array(lines, dtype=cls.dtype)
@@ -694,9 +715,12 @@ class WavelengthCalibration:
 
         return lines
 
-    def build_2d_solution(self, lines, plot=False):
-        """
-        Create a 2D polynomial fit to flagged lines.
+    def fit_wavelengths(self, lines, plot=False):
+        """Fit a wavelength solution to flagged lines (1D per row or 2D).
+
+        Dispatches on ``self.dimensionality``: either a per-row 1D
+        ``np.polyfit`` (rows with too few flagged lines yield NaN coefs and
+        are skipped) or a single 2D polynomial over (pixel, order).
 
         Parameters
         ----------
@@ -707,8 +731,8 @@ class WavelengthCalibration:
 
         Returns
         -------
-        coef : array[degree_x, degree_y]
-            2d polynomial coefficients
+        coef : array
+            1D: shape (ntrace, degree+1). 2D: shape (degree_x, degree_y).
         """
 
         if self.step_mode:
@@ -725,16 +749,18 @@ class WavelengthCalibration:
             coef = np.zeros((ntrace, self.degree + 1))
             for i in range(ntrace):
                 select = m_ord == i
-                if np.count_nonzero(select) < 2:
-                    # Not enough lines for wavelength solution
+                n_select = int(np.count_nonzero(select))
+                if n_select == 0:
+                    coef[i] = np.nan
+                    continue
+                if n_select < 2:
                     logger.warning(
-                        "Not enough valid lines found wavelength calibration in order % i",
-                        i,
+                        "Row %d: only %d flagged line(s); skipping fit", i, n_select
                     )
                     coef[i] = np.nan
                     continue
 
-                deg = max(min(self.degree, np.count_nonzero(select) - 2), 0)
+                deg = max(min(self.degree, n_select - 2), 0)
                 coef[i, -(deg + 1) :] = np.polyfit(
                     m_pix[select], m_wave[select], deg=deg
                 )
@@ -746,7 +772,7 @@ class WavelengthCalibration:
                 f"Parameter 'mode' not understood. Expected '1D' or '2D' but got {self.dimensionality}"
             )
 
-        if plot or self.plot >= 2:  # pragma: no cover
+        if plot or self.plot >= 3:  # pragma: no cover
             self.plot_residuals(lines, coef, title="Residuals")
 
         return coef
@@ -1196,17 +1222,17 @@ class WavelengthCalibration:
             Line data with updated flags
         """
 
-        wave_solution = self.build_2d_solution(lines)
+        wave_solution = self.fit_wavelengths(lines)
         residual = self.calculate_residual(wave_solution, lines)
         nbad = 0
         while np.ma.any(np.abs(residual) > self.threshold):
             lines = self.reject_outlier(residual, lines)
-            wave_solution = self.build_2d_solution(lines)
+            wave_solution = self.fit_wavelengths(lines)
             residual = self.calculate_residual(wave_solution, lines)
             nbad += 1
         logger.info("Discarding %i lines", nbad)
 
-        if plot or self.plot >= 2:  # pragma: no cover
+        if plot or self.plot >= 3:  # pragma: no cover
             mask = lines["flag"]
             _, axis = plt.subplots()
             axis.plot(lines["order"][mask], residual[mask], "X", label="Accepted Lines")
@@ -1404,6 +1430,58 @@ class WavelengthCalibration:
         self.aic = aic
         return aic
 
+    def quality_metrics(self, wave_solution, lines):
+        """Machine-readable quality summary of a wavelength fit.
+
+        Parameters
+        ----------
+        wave_solution : array
+            polynomial coefficients of the wavelength solution
+        lines : LineList or recarray
+            line data with fitted positions and flags
+
+        Returns
+        -------
+        dict
+            Global and per-order statistics over the used (non-rejected)
+            lines: rms and median absolute residual in m/s, line counts,
+            and the AIC of the fit. Per-order keys are physical order
+            numbers when the linelist has an obase, else 0-based indices.
+        """
+        residual = self.calculate_residual(wave_solution, lines)
+        used = np.asarray(lines["flag"], dtype=bool)
+
+        def stats(res):
+            res = res.compressed() if np.ma.isMaskedArray(res) else np.asarray(res)
+            if res.size == 0:
+                return {"nlines": 0, "rms_mps": None, "median_abs_mps": None}
+            return {
+                "nlines": int(res.size),
+                "rms_mps": float(np.sqrt(np.mean(res**2))),
+                "median_abs_mps": float(np.median(np.abs(res))),
+            }
+
+        overall = stats(residual)
+        obase = getattr(lines, "obase", None) or 0
+        orders = {
+            int(obase + order): stats(residual[lines["order"] == order])
+            for order in np.unique(lines["order"])
+        }
+        if overall["nlines"] > 0:
+            aic = float(self.calculate_AIC(lines, wave_solution))
+            if not np.isfinite(aic):
+                aic = None
+        else:
+            aic = None
+        return {
+            "nlines_used": overall["nlines"],
+            "nlines_rejected": int(np.count_nonzero(~used)),
+            "rms_mps": overall["rms_mps"],
+            "median_abs_mps": overall["median_abs_mps"],
+            "aic": aic,
+            "orders": orders,
+        }
+
     def execute(self, obs, lines):
         """
         Perform the whole wavelength calibration procedure with the current settings
@@ -1459,7 +1537,7 @@ class WavelengthCalibration:
         for i in range(self.iterations):
             logger.info(f"Wavelength calibration iteration: {i}")
             # Step 3: Create a wavelength solution on known lines
-            wave_solution = self.build_2d_solution(lines)
+            wave_solution = self.fit_wavelengths(lines)
             wave_img = self.make_wave(wave_solution)
             # Step 4: Identify lines that fit into the solution
             lines = self.auto_id(obs, wave_img, lines)
@@ -1473,7 +1551,7 @@ class WavelengthCalibration:
         )
 
         # Step 6: build final 2d solution
-        wave_solution = self.build_2d_solution(lines, plot=self.plot)
+        wave_solution = self.fit_wavelengths(lines, plot=self.plot)
         wave_img = self.make_wave(wave_solution)
 
         if self.plot:
@@ -1595,10 +1673,10 @@ class WavelengthCalibrationComb(WavelengthCalibration):
 
         # Use now better resolution to find the new solution
         # A single pass of discarding outliers should be enough
-        coef = self.build_2d_solution(laser_lines)
+        coef = self.fit_wavelengths(laser_lines)
         # resid = self.calculate_residual(coef, laser_lines)
         # laser_lines["flag"] = np.abs(resid) < self.threshold
-        # coef = self.build_2d_solution(laser_lines)
+        # coef = self.fit_wavelengths(laser_lines)
         new_wave = self.make_wave(coef)
 
         self.calculate_AIC(laser_lines, coef)
@@ -1667,6 +1745,7 @@ class WavelengthCalibrationInitialize(WavelengthCalibration):
         width_max=8.0,
         cutoff=0.01,
         smoothing=0,
+        wave_delta=20,
         atlas_name="thar",
         atlas_search_dirs=None,
         medium="vac",
@@ -1691,6 +1770,8 @@ class WavelengthCalibrationInitialize(WavelengthCalibration):
         self.width_max = width_max
         self.smoothing = smoothing
         self.cutoff = cutoff
+        #:float: search radius (Angstrom) for the FFT cross-correlation offset
+        self.wave_delta = wave_delta
 
     def get_cutoff(self, spectrum):
         if self.cutoff == 0:
@@ -1716,7 +1797,81 @@ class WavelengthCalibrationInitialize(WavelengthCalibration):
             spectrum /= smax
         return spectrum
 
-    def identify_lines_for_order(self, spectrum, atlas, wave_range, order) -> LineList:
+    @staticmethod
+    def _subpixel_peak(corr, idx):
+        """Parabolic interpolation around a correlation peak for sub-pixel accuracy."""
+        if idx <= 0 or idx >= len(corr) - 1:
+            return float(idx)
+        y0, y1, y2 = corr[idx - 1], corr[idx], corr[idx + 1]
+        denom = 2 * (2 * y1 - y0 - y2)
+        if denom == 0:
+            return float(idx)
+        return idx + (y0 - y2) / denom
+
+    def _measure_shift(self, obs, ref, search_radius):
+        """Cross-correlate obs vs ref (via FFT) and return the sub-pixel shift.
+
+        Returns 0.0 (no shift) when the best correlation sits on the edge of the
+        search window: the true offset then exceeds wave_delta and the lag is
+        meaningless. Logged so a starved/out-of-range init is visible. (A
+        prominence test isn't useful here -- the window is only +/-wave_delta
+        wide, too few points for a meaningful background estimate.)
+        """
+        corr = signal.fftconvolve(obs, ref[::-1], mode="full")
+        mid = len(ref) - 1
+        lo = max(mid - search_radius, 0)
+        hi = min(mid + search_radius + 1, len(corr))
+        search = corr[lo:hi]
+        raw_peak = int(np.argmax(search))
+
+        if raw_peak == 0 or raw_peak == len(search) - 1:
+            logger.warning(
+                "wavecal_init: cross-correlation peak at search-window edge; "
+                "offset likely exceeds wave_delta=%.1f A. Using zero shift.",
+                self.wave_delta,
+            )
+            return 0.0
+
+        peak = self._subpixel_peak(search, raw_peak)
+        return peak - (mid - lo)
+
+    @staticmethod
+    def _synthesize_reference(wave_grid, atlas, line_sigma=3.0):
+        """Synthetic reference spectrum on wave_grid: a Gaussian per atlas line,
+        scaled by the line's height from the atlas continuous spectrum."""
+        n = len(wave_grid)
+        ref = np.zeros(n)
+        w0, w1 = wave_grid[0], wave_grid[-1]  # may be descending (red->blue)
+        glo, ghi = (w0, w1) if w0 <= w1 else (w1, w0)
+        sel = (atlas.linelist["wave"] >= glo) & (atlas.linelist["wave"] <= ghi)
+        lines = atlas.linelist["wave"][sel]
+        if len(lines) == 0:
+            return ref
+        # Use real per-line heights from the atlas continuous spectrum if it has
+        # one; otherwise (line-list-only atlas) fall back to uniform heights.
+        atlas_wave = getattr(atlas, "wave", None)
+        atlas_flux = getattr(atlas, "flux", None)
+        have_spec = atlas_wave is not None and atlas_flux is not None
+        idx = np.arange(n)
+        half_window = 3
+        for w in lines:
+            if have_spec:
+                j = np.searchsorted(atlas_wave, w)
+                lo = max(j - half_window, 0)
+                hi = min(j + half_window + 1, len(atlas_flux))
+                height = np.nanmax(atlas_flux[lo:hi]) if hi > lo else 0.0
+                if not np.isfinite(height) or height < 1e-10:
+                    height = 0.01
+            else:
+                height = 1.0
+            # linear (grid is linspace), direction-agnostic
+            pix = (w - w0) / (w1 - w0) * (n - 1)
+            ref += height * np.exp(-0.5 * ((idx - pix) / line_sigma) ** 2)
+        return ref
+
+    def identify_lines_for_order(
+        self, spectrum, atlas, wave_range, order, bundle=-1, is_bundle=False
+    ) -> LineList:
         """Identify spectral lines via iterative peak matching (IDL algorithm).
 
         Detects peaks in the observed spectrum, matches them to atlas lines
@@ -1739,6 +1894,8 @@ class WavelengthCalibrationInitialize(WavelengthCalibration):
         LineList
             matched lines for this order
         """
+        label = f"Bundle {bundle}" if is_bundle else f"Order {order}"
+
         spectrum = np.asarray(spectrum)
         npix = spectrum.shape[0]
         x = np.arange(npix)
@@ -1758,7 +1915,7 @@ class WavelengthCalibrationInitialize(WavelengthCalibration):
         min_idx = np.where(minima)[0]
 
         if len(peak_idx) == 0:
-            logger.warning("Order %d: no peaks found", order)
+            logger.warning("%s: no peaks found", label)
             return LineList()
 
         # Filter: reject peaks near edges
@@ -1822,7 +1979,7 @@ class WavelengthCalibrationInitialize(WavelengthCalibration):
         heights = heights[fit_ok]
 
         if len(posm) == 0:
-            logger.warning("Order %d: no valid peaks after Gaussian fitting", order)
+            logger.warning("%s: no valid peaks after Gaussian fitting", label)
             return LineList()
 
         # Atlas lines within the expected range (with margin)
@@ -1834,46 +1991,31 @@ class WavelengthCalibrationInitialize(WavelengthCalibration):
         atlas_sub = atlas_waves[atlas_mask]
 
         if len(atlas_sub) == 0:
-            logger.warning(
-                "Order %d: no atlas lines in range %.1f-%.1f", order, wmin, wmax
-            )
+            logger.warning("%s: no atlas lines in range %.1f-%.1f", label, wmin, wmax)
             return LineList()
 
-        # Step 1: linear wavelength assignment
-        wlc = wave_range[0] + (wave_range[1] - wave_range[0]) * posm / npix
+        # Step 1: linear wavelength assignment from the per-bundle guess.
+        # Use (npix-1) so pixel npix-1 maps exactly to wave_range[1], matching
+        # the linspace grid the synthetic reference is built on below.
+        span = npix - 1
+        wlc = wave_range[0] + (wave_range[1] - wave_range[0]) * posm / span
 
-        # Step 2: offset voting - match each atlas line to nearest peak,
-        # histogram the wavelength offsets to find the true shift
-        offsets = []
-        for aw in atlas_sub:
-            dw = np.abs(wlc - aw)
-            best = np.argmin(dw)
-            if dw[best] < self.match_tolerance:
-                offsets.append(aw - wlc[best])
+        # Step 2: FFT cross-correlation for the global wavelength offset.
+        # Cross-correlating the whole observed spectrum against a synthetic atlas
+        # reference finds the single best global alignment, avoiding the alias
+        # that per-line offset-voting locks onto in a dense line forest.
+        wave_linear = np.linspace(wave_range[0], wave_range[1], npix)
+        reference = self.normalize(self._synthesize_reference(wave_linear, atlas))
+        dispersion = (wave_range[1] - wave_range[0]) / span
+        pix_per_ang = span / abs(wave_range[1] - wave_range[0])
+        search_radius = int(self.wave_delta * pix_per_ang) + 1
+        global_shift = self._measure_shift(spectrum, reference, search_radius)
+        wlc = wlc - global_shift * dispersion
 
-        if len(offsets) < self.degree + 1:
-            logger.warning("Order %d: only %d coarse matches", order, len(offsets))
-            return LineList()
-
-        offsets = np.array(offsets)
-        n_bins = max(10, len(offsets) // 2)
-        hist, edges = np.histogram(offsets, bins=n_bins)
-        best_bin = np.argmax(hist)
-        mode_offset = (edges[best_bin] + edges[best_bin + 1]) / 2
-        bin_width = edges[1] - edges[0]
-        near_mode = offsets[np.abs(offsets - mode_offset) < bin_width * 3]
-        if len(near_mode) >= 3:
-            wave_offset = np.median(near_mode)
-        else:
-            wave_offset = mode_offset
-
-        # Apply offset correction
-        wlc += wave_offset
-
-        # Step 3: iterative match-fit-reject using corrected wavelengths
-        # After voting, the corrected wlc is accurate to ~bin_width,
-        # so use a tight tolerance for individual matching (like IDL's 0.02A)
-        tight_tol = max(0.02, bin_width * 2)
+        # Step 3: iterative match-fit-reject using corrected wavelengths.
+        # After the FFT alignment the corrected wlc is accurate to ~1 px, so use
+        # match_tolerance for the first individual matching pass.
+        tight_tol = self.match_tolerance
 
         best_peak = np.array([])
         best_atlas = np.array([])
@@ -1945,6 +2087,12 @@ class WavelengthCalibrationInitialize(WavelengthCalibration):
         matched_width = best_width
         matched_height = best_height
 
+        save_tag = (
+            f"wavecal_init_bundle_{bundle}"
+            if is_bundle
+            else f"wavecal_init_order_{order}"
+        )
+
         if len(matched_peak) > 0:
             linelist = LineList()
             for j in range(len(matched_peak)):
@@ -1955,9 +2103,20 @@ class WavelengthCalibrationInitialize(WavelengthCalibration):
                     matched_width[j],
                     matched_height[j],
                     True,
+                    bundle=bundle,
                 )
 
+            # Cap per-row plots so single-order multi-bundle runs don't
+            # spawn dozens of figures (mirrors _fit_single_line's "5 of many").
+            if not hasattr(self, "_init_plot_count"):
+                self._init_plot_count = 0
             if self.plot:
+                self._init_plot_count += 1
+                if self._init_plot_count == 6:
+                    logger.info(
+                        "Skipping remaining wavecal_init plots (shown 5 of many)"
+                    )
+            if self.plot and self._init_plot_count <= 5:
                 wave = np.polyval(coef, x)
                 atlas_flux = np.interp(wave, atlas.wave, atlas.flux)
                 atlas_flux /= np.max(atlas_flux)
@@ -1970,13 +2129,13 @@ class WavelengthCalibrationInitialize(WavelengthCalibration):
                     markersize=4,
                     label=f"{len(matched_peak)} matches",
                 )
-                title = f"Order {order}"
+                title = f"{label} ({self._init_plot_count}/5)"
                 if self.plot_title:
                     title = f"{self.plot_title}\n{title}"
                 plt.title(title)
                 plt.xlabel("Wavelength [A]")
                 plt.legend(fontsize="small")
-                util.show_or_save(f"wavecal_init_order_{order}")
+                util.show_or_save(save_tag)
 
             rms = np.std(
                 (np.polyval(coef, matched_peak) - matched_atlas)
@@ -1984,24 +2143,35 @@ class WavelengthCalibrationInitialize(WavelengthCalibration):
                 * speed_of_light
             )
             logger.info(
-                "Order %d: matched %d lines, rms=%.1f m/s",
-                order,
-                len(matched_peak),
-                rms,
+                "%s: matched %d lines, rms=%.1f m/s", label, len(matched_peak), rms
             )
             return linelist
 
-        logger.warning("Order %d: no lines matched", order)
+        logger.warning("%s: no lines matched", label)
         return LineList()
 
-    def execute(self, spectrum, wave_range) -> LineList:
+    def execute(self, spectrum, wave_range, single_order=False) -> LineList:
         atlas = LineAtlas(
             self.atlas_name, self.medium, search_dirs=self.atlas_search_dirs
         )
         linelist = LineList()
-        for order in range(spectrum.shape[0]):
+        n_rows = spectrum.shape[0]
+        # Single-order multi-fiber instruments (e.g. MOSAIC) give one wave_range
+        # entry but extract many bundles -- reuse the same range for each row.
+        if len(wave_range) == 1 and n_rows > 1:
+            logger.info(
+                "wavelength_range has 1 entry but spectrum has %d rows; broadcasting",
+                n_rows,
+            )
+            wave_range = [wave_range[0]] * n_rows
+        for order in range(n_rows):
             ll = self.identify_lines_for_order(
-                spectrum[order], atlas, wave_range[order], order
+                spectrum[order],
+                atlas,
+                wave_range[order],
+                order,
+                bundle=order if single_order else -1,
+                is_bundle=single_order,
             )
             linelist.append(ll)
         return linelist

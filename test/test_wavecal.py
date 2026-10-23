@@ -45,6 +45,28 @@ class TestLineList:
 
         assert len(ll) == 1
         assert ll["wlc"][0] == pytest.approx(5000.0)
+        # bundle defaults to -1 (not bundled)
+        assert ll["bundle"][0] == -1
+
+    @pytest.mark.unit
+    def test_bundle_field_roundtrip(self):
+        """bundle column survives from_list and add_line."""
+        ll = LineList.from_list(
+            [5000, 6000],
+            order=[0, 0],
+            pos=[100, 200],
+            width=[3, 3],
+            height=[1, 0.8],
+            flag=[True, True],
+            bundle=[7, 12],
+        )
+        assert list(ll["bundle"]) == [7, 12]
+
+        ll2 = LineList()
+        ll2.add_line(
+            wave=5000.0, order=0, pos=100, width=3, height=1.0, flag=True, bundle=42
+        )
+        assert ll2["bundle"][0] == 42
 
     @pytest.mark.unit
     def test_append(self):
@@ -225,6 +247,67 @@ class TestWavelengthCalibrationResidual:
         # Residual = (5010 - 5015) / 5015 * c ~ -300 km/s
         assert residual[0] < 0
         assert np.abs(residual[0]) > 100000  # Large residual
+
+
+class TestWavelengthCalibrationQualityMetrics:
+    """Unit tests for WavelengthCalibration.quality_metrics."""
+
+    @pytest.fixture
+    def wc_and_lines(self):
+        from scipy.constants import speed_of_light
+
+        wc = WavelengthCalibration(dimensionality="1D", degree=1, plot=False)
+        # Solution: wavelength = 5000 + 0.1*x
+        solution = np.array([[0.1, 5000.0]])
+
+        lines = np.zeros(5, dtype=LineList.dtype)
+        lines["posm"] = [100, 200, 300, 400, 500]
+        lines["order"] = [0, 0, 0, 0, 0]
+        lines["wll"] = 5000.0 + 0.1 * lines["posm"]
+        lines["flag"] = [True, True, True, True, False]
+        # One used line offset by ~100 m/s
+        lines["wll"][2] *= 1 - 100 / speed_of_light
+        return wc, solution, LineList(lines)
+
+    @pytest.mark.unit
+    def test_quality_metrics_counts_and_rms(self, wc_and_lines):
+        wc, solution, lines = wc_and_lines
+
+        metrics = wc.quality_metrics(solution, lines)
+
+        assert metrics["nlines_used"] == 4
+        assert metrics["nlines_rejected"] == 1
+        # Used residuals are [0, 0, ~100, 0] m/s -> rms = 50
+        assert metrics["rms_mps"] == pytest.approx(50.0, rel=1e-3)
+        assert metrics["median_abs_mps"] == pytest.approx(0.0, abs=1e-3)
+        assert np.isfinite(metrics["aic"])
+
+    @pytest.mark.unit
+    def test_quality_metrics_per_order_with_obase(self, wc_and_lines):
+        wc, solution, lines = wc_and_lines
+        lines.obase = 90
+
+        metrics = wc.quality_metrics(solution, lines)
+
+        # Per-order keys use physical order numbers when obase is set
+        assert list(metrics["orders"].keys()) == [90]
+        assert metrics["orders"][90]["nlines"] == 4
+        assert metrics["orders"][90]["rms_mps"] == pytest.approx(50.0, rel=1e-3)
+
+    @pytest.mark.unit
+    def test_quality_metrics_all_rejected(self):
+        wc = WavelengthCalibration(dimensionality="1D", degree=1, plot=False)
+        solution = np.array([[0.1, 5000.0]])
+        lines = np.zeros(2, dtype=LineList.dtype)
+        lines["posm"] = [100, 200]
+        lines["order"] = [0, 0]
+        lines["wll"] = 5000.0 + 0.1 * lines["posm"]
+        lines["flag"] = [False, False]
+
+        metrics = wc.quality_metrics(solution, LineList(lines))
+
+        assert metrics["nlines_used"] == 0
+        assert metrics["rms_mps"] is None
 
 
 class TestWavelengthCalibrationNormalize:
@@ -616,6 +699,65 @@ class TestWavecalFinalizeTraceUpdate:
         assert loaded_traces[2].wave is not None
         assert loaded_traces[2].wave[1] == pytest.approx(6000)
         assert loaded_traces[3].wave[1] == pytest.approx(6500)
+
+    @pytest.mark.unit
+    def test_update_traces_single_order_multi_bundle_keeps_m_none(
+        self, mock_instrument, tmp_path
+    ):
+        """_update_traces must not overwrite t.m for single-order multi-bundle traces.
+
+        Models MOSAIC: traces have m=None and bundle=N. Even when the
+        linelist provides an obase, _update_traces should leave m=None and
+        still populate t.wave per row.
+        """
+        from pyreduce.configuration import load_config
+        from pyreduce.reduce import WavelengthCalibrationFinalize
+        from pyreduce.trace_model import Trace
+        from pyreduce.wavelength_calibration import LineList
+
+        traces = [
+            Trace(
+                m=None,
+                bundle=b,
+                pos=np.array([1, 0, 100 + b * 50]),
+                column_range=(0, 100),
+            )
+            for b in (1, 2, 3)
+        ]
+
+        config = load_config(None, "UVES")
+        config["wavecal"]["dimensionality"] = "1D"
+        step = WavelengthCalibrationFinalize(
+            mock_instrument,
+            "RED",
+            "test",
+            "2024-01-01",
+            str(tmp_path),
+            None,
+            **config["wavecal"],
+        )
+
+        # 1D wave polys, one row per bundle
+        wave = np.array([[0.1, 5000], [0.1, 5100], [0.1, 5200]])
+        ll = LineList.from_list(
+            [5000.0, 5100.0, 5200.0],
+            order=[0, 1, 2],
+            pos=[50, 50, 50],
+            width=[3, 3, 3],
+            height=[1.0, 1.0, 1.0],
+            flag=[True, True, True],
+            bundle=[1, 2, 3],
+        )
+        ll.obase = 42  # would normally produce m=42,43,44
+
+        step._update_traces(traces, {"all": (wave, ll)})
+
+        # m stays None because these are bundles, not orders
+        assert all(t.m is None for t in traces)
+        # wave is populated per row
+        for i, t in enumerate(traces):
+            assert t.wave is not None
+            np.testing.assert_allclose(t.wave, wave[i])
 
     @pytest.mark.unit
     def test_wavecal_finalize_saves_to_traces_2d(
@@ -1101,6 +1243,78 @@ class TestWavecalInitIdentify:
         assert len(orders_found) == norders
 
     @pytest.mark.unit
+    def test_execute_single_order_tags_bundles(self, tmp_path):
+        """single_order=True: every emitted line has order=0 and bundle=row_idx."""
+        npix = 1000
+        nrows = 4
+        peak_pixels = np.array([100, 300, 500, 700, 900])
+        w0 = 5000.0
+
+        spectrum = np.stack(
+            [self._make_spectrum(npix, peak_pixels) for _ in range(nrows)]
+        )
+        wave_range = [[w0, w0 + 0.05 * npix]]
+
+        atlas_dir = tmp_path / "atlas"
+        atlas_dir.mkdir()
+        with open(atlas_dir / "synlamp_list.txt", "w") as f:
+            for px in peak_pixels:
+                f.write(f"{w0 + 0.05 * px}\n")
+
+        wci = WavelengthCalibrationInitialize(
+            degree=2,
+            plot=False,
+            cutoff=0,
+            atlas_name="synlamp",
+            atlas_search_dirs=[str(atlas_dir)],
+        )
+        ll = wci.execute(spectrum, wave_range, single_order=True)
+
+        # In single-order mode, the linelist still uses `order` as a row
+        # selector (so the per-row 1D fitter still works), but the explicit
+        # bundle column carries the bundle id.
+        assert set(ll["bundle"]) == set(range(nrows))
+        # Default multi-order path leaves bundle=-1.
+        ll2 = wci.execute(spectrum, [wave_range[0]] * nrows, single_order=False)
+        assert set(ll2["bundle"]) == {-1}
+
+    @pytest.mark.unit
+    def test_execute_broadcasts_single_wave_range(self, tmp_path):
+        """A single wave_range entry is reused for every spectrum row.
+
+        Models the MOSAIC layout: one spectral order, many fiber bundles. The
+        wavecal_master output has shape (n_bundles, n_pixels); every bundle
+        sees the same wavelength range, so one entry should suffice.
+        """
+        npix = 1000
+        nrows = 4
+        peak_pixels = np.array([100, 300, 500, 700, 900])
+        w0 = 5000.0
+
+        spectrum = np.stack(
+            [self._make_spectrum(npix, peak_pixels) for _ in range(nrows)]
+        )
+        wave_range = [[w0, w0 + 0.05 * npix]]  # one entry, not nrows
+
+        atlas_dir = tmp_path / "atlas"
+        atlas_dir.mkdir()
+        with open(atlas_dir / "synlamp_list.txt", "w") as f:
+            for px in peak_pixels:
+                f.write(f"{w0 + 0.05 * px}\n")
+
+        wci = WavelengthCalibrationInitialize(
+            degree=2,
+            plot=False,
+            cutoff=0,
+            atlas_name="synlamp",
+            atlas_search_dirs=[str(atlas_dir)],
+        )
+        ll = wci.execute(spectrum, wave_range)
+
+        # every row produced lines, all distinct order indices appear
+        assert set(ll["order"]) == set(range(nrows))
+
+    @pytest.mark.unit
     def test_cutoff_filters_faint_peaks(self):
         """Peaks below the cutoff fraction of the maximum are rejected."""
         npix = 1000
@@ -1179,3 +1393,9 @@ def test_wavecal(
     assert wave.shape[0] == trace_range[1] - trace_range[0]
     assert wave.shape[1] == orig.shape[1]
     assert np.issubdtype(wave.dtype, np.floating)
+
+    metrics = module.quality_metrics(solution, lines)
+    assert metrics["nlines_used"] > 0
+    # A sane ThAr solution should be well below the rejection threshold
+    assert 0 < metrics["rms_mps"] < settings[name]["threshold"]
+    assert len(metrics["orders"]) > 0
