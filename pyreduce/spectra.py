@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 import astropy.io.fits as fits
 import numpy as np
 import scipy.constants
+from scipy import sparse
 
 from .provenance import add_provenance
 
@@ -29,7 +30,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Format version for backwards compatibility detection
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 
 
 @dataclass
@@ -117,6 +118,9 @@ class Spectrum:
         Slit function (shape depends on osample: height * osample + 1).
     extraction_height : float | None
         Extraction aperture used for this trace.
+    covariance : scipy.sparse.csr_matrix | None
+        Propagated spectral covariance in squared flux units, including fitted
+        profile and swath overlap. Invalid samples have NaN diagonal entries.
     """
 
     # Identity (copied from Trace)
@@ -133,6 +137,7 @@ class Spectrum:
     cont: np.ndarray | None = None
     slitfu: np.ndarray | None = None
     extraction_height: float | None = None
+    covariance: sparse.csr_matrix | None = None
 
     @classmethod
     def from_trace(
@@ -363,8 +368,8 @@ class Spectra:
         ncol = self.ncol
 
         # Stack arrays
-        spec_arr = np.array([s.spec for s in self.data], dtype=np.float32)
-        sig_arr = np.array([s.sig for s in self.data], dtype=np.float32)
+        spec_arr = np.array([s.spec for s in self.data], dtype=np.float64)
+        sig_arr = np.array([s.sig for s in self.data], dtype=np.float64)
         m_arr = np.array(
             [s.m if s.m is not None else -1 for s in self.data], dtype=np.int16
         )
@@ -381,10 +386,13 @@ class Spectra:
             dtype=np.float32,
         )
 
+        # Units are supplied by the caller; generic spectra need not carry them.
+        flux_unit = self.header["BUNIT"] if "BUNIT" in self.header else None
+        covariance_unit = self.header["COVUNIT"] if "COVUNIT" in self.header else None
         # Build columns
         columns = [
-            fits.Column(name="SPEC", format=f"{ncol}E", array=spec_arr),
-            fits.Column(name="SIG", format=f"{ncol}E", array=sig_arr),
+            fits.Column(name="SPEC", format=f"{ncol}D", array=spec_arr, unit=flux_unit),
+            fits.Column(name="SIG", format=f"{ncol}D", array=sig_arr, unit=flux_unit),
             fits.Column(name="M", format="I", array=m_arr),
             fits.Column(name="GROUP", format="16A", array=group_arr),
             fits.Column(name="FIBER_IDX", format="I", array=fiber_idx_arr),
@@ -436,6 +444,20 @@ class Spectra:
         table = fits.BinTableHDU.from_columns(columns, name="SPECTRA")
 
         hdulist = fits.HDUList([primary, table])
+        for index, spectrum in enumerate(self.data):
+            if spectrum.covariance is not None:
+                covariance = spectrum.covariance.tocsr()
+                if covariance.shape != (len(spectrum.spec), len(spectrum.spec)):
+                    raise ValueError("Spectrum covariance shape does not match its flux samples")
+                covariance_columns = [
+                    fits.Column(name="DATA", format="PD()", array=[covariance.data], unit=covariance_unit),
+                    fits.Column(name="INDICES", format="PJ()", array=[covariance.indices]),
+                    fits.Column(name="INDPTR", format="PJ()", array=[covariance.indptr]),
+                ]
+                extension = fits.BinTableHDU.from_columns(covariance_columns, name=f"COV{index:04d}")
+                extension.header["NCOL"] = len(spectrum.spec)
+                extension.header["SPINDEX"] = index
+                hdulist.append(extension)
         hdulist.writeto(fname, overwrite=True, output_verify="silentfix+ignore")
         logger.info("Saved %d spectra to: %s", ntrace, fname)
 
@@ -482,6 +504,17 @@ def _read_new_format(
         sig_arr = sig_arr / cont_arr
 
     params = ExtractionParams.from_header(header)
+    covariances = {}
+    with fits.open(fname, memmap=False) as hdus:
+        for hdu in hdus[2:]:
+            if hdu.name.startswith("COV"):
+                index = hdu.header["SPINDEX"]
+                ncol = hdu.header["NCOL"]
+                covariance = sparse.csr_matrix((hdu.data["DATA"][0], hdu.data["INDICES"][0], hdu.data["INDPTR"][0]), shape=(ncol, ncol))
+                if not raw and continuum_normalization and cont_arr is not None:
+                    scale = 1 / cont_arr[index]
+                    covariance = covariance.multiply(scale[:, None]).multiply(scale[None, :]).tocsr()
+                covariances[index] = covariance
 
     spectra = []
     for i in range(len(spec_arr)):
@@ -529,6 +562,7 @@ def _read_new_format(
                 cont=cont,
                 slitfu=slitfu,
                 extraction_height=height,
+                covariance=covariances[i] if i in covariances else None,
             )
         )
 

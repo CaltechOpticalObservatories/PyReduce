@@ -438,10 +438,10 @@ def _residual_rms(ncols, nrows, delta_x, im, model, mask):
 
 
 @njit(**_KW)
-def _reject_outliers(ncols, nrows, delta_x, im, model, mask, cutoff):
+def _reject_outliers(ncols, nrows, delta_x, im, model, mask, original_mask, cutoff):
     for y in range(nrows):
         for x in range(delta_x, ncols - delta_x):
-            if abs(model[y, x] - im[y, x]) < cutoff:
+            if original_mask[y, x] and abs(model[y, x] - im[y, x]) <= cutoff:
                 mask[y, x] = 1
             else:
                 mask[y, x] = 0
@@ -500,6 +500,7 @@ def _slitdec_core(
     unc,
     info,
 ):
+    original_mask = mask.copy()
     sP_stop = 5e-5  # 99th percentile spectrum change relative to median
     sP_change = math.inf
     success = 1.0
@@ -673,7 +674,7 @@ def _slitdec_core(
 
         dev = _residual_rms(ncols, nrows, delta_x, im, model, mask)
         if kappa > 0:
-            _reject_outliers(ncols, nrows, delta_x, im, model, mask, kappa * dev)
+            _reject_outliers(ncols, nrows, delta_x, im, model, mask, original_mask, kappa * dev)
 
         prev = it
         it += 1

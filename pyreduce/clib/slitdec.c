@@ -950,6 +950,7 @@ int slitdec(        int ncols,
     int iter, delta_x;
     unsigned int isum;
     int *ycen_offset;
+    unsigned char *original_mask;
     int y_lower_lim = nrows / 2;
 
     // For the solving of the equation system
@@ -1130,6 +1131,9 @@ int slitdec(        int ncols,
 #if DEBUG
     _nx = nx;
 #endif
+
+    original_mask = malloc(ncols * nrows * sizeof(*original_mask));
+    memcpy(original_mask, mask, ncols * nrows * sizeof(*original_mask));
 
     /* Preset slit function: the caller supplies sL and we skip solving for
        it. Normalize the preset once here (to sum osample) so callers do not
@@ -1509,7 +1513,7 @@ int slitdec(        int ncols,
             {
                 for (x = delta_x; x < ncols - delta_x; x++)
                 {
-                    if (fabs(model[im_index(x, y)] - im[im_index(x, y)]) < kappa * dev)
+                    if (original_mask[im_index(x, y)] && fabs(model[im_index(x, y)] - im[im_index(x, y)]) <= kappa * dev)
                         mask[im_index(x, y)] = 1;
                     else
                         mask[im_index(x, y)] = 0;
@@ -1625,6 +1629,7 @@ int slitdec(        int ncols,
         }
     }
 
+    free(original_mask);
     free(sP_old);
     free(sP_diff);
     free(norm_sq);

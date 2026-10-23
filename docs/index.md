@@ -42,6 +42,7 @@ examples
 manual_calls
 configuration_file
 output_formats
+extraction_uncertainty
 instruments
 wavecal_linelist
 modules

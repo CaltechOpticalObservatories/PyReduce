@@ -263,7 +263,7 @@ class TestSpectraSaveLoadRoundtrip:
         basic_spectra.save(path)
         loaded = Spectra.read(path)
 
-        assert loaded.header["E_FMTVER"] == 2
+        assert loaded.header["E_FMTVER"] == 3
 
     def test_steps_written(self, tmp_path, basic_spectra):
         """E_STEPS header keyword is written."""

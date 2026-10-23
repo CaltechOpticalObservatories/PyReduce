@@ -782,12 +782,7 @@ class Curvature:
 
                 # White line: polynomial + slitdeltas (if available)
                 if slitdeltas is not None and i < slitdeltas.shape[0]:
-                    # Interpolate slitdeltas to curve_height resolution
-                    sd = slitdeltas[i]
-                    if len(sd) != ew:
-                        sd_x = np.linspace(0, 1, len(sd))
-                        curve_x_interp = np.linspace(0, 1, ew)
-                        sd = np.interp(curve_x_interp, sd_x, sd)
+                    sd = np.interp(y_offsets, self.slitdelta_y[i], slitdeltas[i], left=0, right=0)
                     curve_x_with_delta = curve_x + sd
                     plt.plot(curve_x_with_delta, y_plot, "w", linewidth=0.5, alpha=0.8)
 
@@ -822,11 +817,16 @@ class Curvature:
         -------
         slitdeltas : array of shape (ntrace, nrows)
             Per-row residual offsets for each trace, covering curve_height range.
-            During extraction, interpolated to match swath size.
+            Coordinates are retained in slitdelta_y; extraction samples that physical grid.
         """
         slitdeltas = np.zeros((self.n, nrows))
+        self.slitdelta_y = np.empty_like(slitdeltas)
 
         for j in range(self.n):
+            xwd = self.curve_height[j]
+            half = xwd // 2
+            row_offsets = np.linspace(-half, xwd - half, nrows)
+            self.slitdelta_y[j] = row_offsets
             offsets = all_offsets[j]
             residuals = all_residuals[j]
 
@@ -835,12 +835,6 @@ class Curvature:
 
             # Average residuals across peaks at each offset (ignoring NaN)
             mean_resid = np.nanmedian(residuals, axis=0)
-
-            # Map offsets to row indices
-            # offsets are relative to trace center
-            xwd = self.curve_height[j]
-            half = xwd // 2
-            row_offsets = np.linspace(-half, xwd - half, nrows)
 
             # Interpolate from measured offsets to per-row
             valid = ~np.isnan(mean_resid)
@@ -864,7 +858,7 @@ class Curvature:
         Returns
         -------
         dict
-            Curvature data with keys: coeffs, slitdeltas, degree, fitted_coeffs, fit_degree.
+            Curvature data with keys: coeffs, slitdeltas, slitdelta_y, degree, fitted_coeffs, fit_degree.
         """
         logger.info("Determining the Slit Curvature")
 
@@ -892,10 +886,12 @@ class Curvature:
 
         # Compute slitdeltas from residuals
         slitdeltas = None
+        slitdelta_y = None
         if compute_slitdeltas:
             # Use max curve height to determine nrows (full measured range)
             max_curve = int(np.max(self.curve_height)) + 1
             slitdeltas = self._compute_slitdeltas(all_offsets, all_residuals, max_curve)
+            slitdelta_y = self.slitdelta_y
             logger.info(
                 "Computed slitdeltas with shape %s, range [%.4f, %.4f]",
                 slitdeltas.shape,
@@ -929,6 +925,7 @@ class Curvature:
         return {
             "coeffs": coeffs,
             "slitdeltas": slitdeltas,
+            "slitdelta_y": slitdelta_y,
             "degree": self.curve_degree,
             "fitted_coeffs": compact,
             "fit_degree": fit_deg,

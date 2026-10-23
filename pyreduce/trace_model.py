@@ -26,7 +26,8 @@ logger = logging.getLogger(__name__)
 # v2: Initial FITS format with FIBER column
 # v3: Renamed FIBER→GROUP, added FIBER_IDX column
 # v4: Added BUNDLE column (bundle id, independent of m)
-FORMAT_VERSION = 4
+# v5: Preserve physical pixel coordinates of residual slit corrections
+FORMAT_VERSION = 5
 
 
 @dataclass
@@ -106,6 +107,8 @@ class Trace:
     slitdelta : np.ndarray | None
         Per-row slit correction, shape (height_pixels,).
         Residual offsets beyond polynomial fit.
+    slitdelta_y : np.ndarray | None
+        Pixel offsets from the trace center at which slitdelta was calibrated.
     wave : np.ndarray | None
         Wavelength polynomial coefficients. Can be:
         - 1D array, shape (deg+1,): per-trace polynomial, wavelength = polyval(x)
@@ -130,6 +133,7 @@ class Trace:
     wave: np.ndarray | None = None
     _wave_idx: int | None = None  # trace index for 2D polynomial evaluation
     invalid: str | None = None  # reason if trace should be skipped
+    slitdelta_y: np.ndarray | None = None
 
     def slit_at_x(self, x: float | np.ndarray) -> np.ndarray | None:
         """Evaluate slit polynomial coefficients at position x.
@@ -393,11 +397,15 @@ def save_traces(
                 slit_arr[i, :sy, :sx] = t.slit
 
     slitdelta_arr = None
+    slitdelta_y_arr = None
     if max_slitdelta_len > 0:
-        slitdelta_arr = np.full((ntrace, max_slitdelta_len), np.nan, dtype=np.float32)
+        slitdelta_arr = np.full((ntrace, max_slitdelta_len), np.nan, dtype=np.float64)
+        slitdelta_y_arr = np.full_like(slitdelta_arr, np.nan)
         for i, t in enumerate(traces):
             if t.slitdelta is not None:
                 slitdelta_arr[i, : len(t.slitdelta)] = t.slitdelta
+                if t.slitdelta_y is not None:
+                    slitdelta_y_arr[i, : len(t.slitdelta)] = t.slitdelta_y
 
     # Build FITS columns
     columns = [
@@ -426,9 +434,12 @@ def save_traces(
     if slitdelta_arr is not None:
         columns.append(
             fits.Column(
-                name="SLITDELTA", format=f"{max_slitdelta_len}E", array=slitdelta_arr
+                name="SLITDELTA", format=f"{max_slitdelta_len}D", array=slitdelta_arr, unit="pixel"
             )
         )
+
+    if slitdelta_y_arr is not None:
+        columns.append(fits.Column(name="SLITDELTA_Y", format=f"{max_slitdelta_len}D", array=slitdelta_y_arr, unit="pixel"))
 
     if wave_arr is not None:
         if wave_is_2d:
@@ -502,6 +513,7 @@ def load_traces(path: str | Path) -> tuple[list[Trace], fits.Header]:
 
         slit_arr = data["SLIT"] if "SLIT" in data.dtype.names else None
         slitdelta_arr = data["SLITDELTA"] if "SLITDELTA" in data.dtype.names else None
+        slitdelta_y_arr = data["SLITDELTA_Y"] if "SLITDELTA_Y" in data.dtype.names else None
         wave_arr = data["WAVE"] if "WAVE" in data.dtype.names else None
 
         # Reshape slit if present
@@ -570,6 +582,12 @@ def load_traces(path: str | Path) -> tuple[list[Trace], fits.Header]:
                 else:
                     slitdelta = slitdelta[~np.isnan(slitdelta)]
 
+            slitdelta_y = None
+            if slitdelta_y_arr is not None and slitdelta is not None:
+                coordinates = slitdelta_y_arr[i]
+                if not np.all(np.isnan(coordinates)):
+                    slitdelta_y = coordinates[~np.isnan(slitdelta_arr[i])]
+
             wave = None
             if wave_arr is not None:
                 wave = wave_arr[i]
@@ -595,6 +613,7 @@ def load_traces(path: str | Path) -> tuple[list[Trace], fits.Header]:
                     height=height,
                     slit=slit,
                     slitdelta=slitdelta,
+                    slitdelta_y=slitdelta_y,
                     wave=wave,
                 )
             )

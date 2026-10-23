@@ -536,3 +536,17 @@ def test_curvature_zero(original, traces, trace_range):
     # With zero image, should produce zero curvature
     module = CurvatureModule(traces_subset, plot=False, sigma_cutoff=0)
     _ = module.execute(original)
+
+
+@pytest.mark.unit
+def test_residual_grid_preserves_each_measured_physical_height():
+    traces = [Trace(m=1, pos=np.array([40.]), column_range=(0, 100)), Trace(m=2, pos=np.array([80.]), column_range=(0, 100))]
+    module = CurvatureModule(traces, curve_height=40)
+    module.trace_range = (0, 2)
+    module.curve_height = np.array([40, 10])
+    offsets = [np.array([-20., 0., 20.]), np.array([-5., 0., 5.])]
+    residuals = [.02*y[None, :] for y in offsets]
+    measured = module._compute_slitdeltas(offsets, residuals, 41)
+    for i, height in enumerate([40, 10]):
+        np.testing.assert_allclose(module.slitdelta_y[i], np.linspace(-height/2, height/2, 41))
+        np.testing.assert_allclose(measured[i], .02*module.slitdelta_y[i], atol=1e-15)
