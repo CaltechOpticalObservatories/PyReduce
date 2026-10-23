@@ -283,3 +283,14 @@ def test_channel_fallbacks_passed_through_load_config():
     finally:
         if os.path.exists(band_file):
             os.remove(band_file)
+
+
+def test_wavecal_initial_search_radius_is_recognized(caplog):
+    import inspect
+    from pyreduce.wavelength_calibration import WavelengthCalibrationInitialize
+
+    defaults = conf.read_config()
+    assert defaults['wavecal_init']['wave_delta'] == inspect.signature(WavelengthCalibrationInitialize).parameters['wave_delta'].default
+    updated = conf.update(defaults, {'wavecal_init': {'wave_delta': 5}}, check=True)
+    assert updated['wavecal_init']['wave_delta'] == 5
+    assert 'wave_delta is not contained' not in caplog.text
