@@ -513,6 +513,7 @@ class SlitCurvatureDetermination(CalibrationStep, ExtractionStep):
                 t.slit = fitted_coeffs[i]
             if slitdeltas is not None and i < slitdeltas.shape[0]:
                 t.slitdelta = slitdeltas[i]
+                t.slitdelta_y = curvature["slitdelta_y"][i]
 
         self.save(trace_list)
         return trace_list
@@ -537,6 +538,7 @@ class SlitCurvatureDetermination(CalibrationStep, ExtractionStep):
                 if match is not None:
                     t.slit = match.slit
                     t.slitdelta = match.slitdelta
+                    t.slitdelta_y = match.slitdelta_y
 
             # Save updated traces
             steps = header.get("E_STEPS", "trace").split(",")

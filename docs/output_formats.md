@@ -3,16 +3,16 @@
 PyReduce produces FITS files containing extracted spectra. This page documents
 the file structure.
 
-## Spectra Format (v2)
+## Spectra Format (v3)
 
 The current format stores spectra in a FITS binary table with one row per trace.
-Files are identified by header keyword `E_FMTVER = 2`.
+Files are identified by header keyword `E_FMTVER = 3`.
 
 ### Header Keywords
 
 | Keyword | Description |
 |---------|-------------|
-| `E_FMTVER` | Format version (2 for current format) |
+| `E_FMTVER` | Format version (3 for current format) |
 | `E_STEPS` | Comma-separated list of pipeline steps run |
 | `E_OSAMPLE` | Extraction oversampling factor |
 | `E_LAMBDASF` | Slit function smoothing parameter |
@@ -36,8 +36,8 @@ The binary table extension (named `SPECTRA`) contains:
 
 | Column | Format | Description |
 |--------|--------|-------------|
-| `SPEC` | `{ncol}E` | Extracted spectrum (float32). NaN for masked pixels. |
-| `SIG` | `{ncol}E` | Uncertainty (float32). NaN for masked pixels. |
+| `SPEC` | `{ncol}D` | Extracted spectrum (float64). NaN for masked pixels. |
+| `SIG` | `{ncol}D` | Uncertainty (float64). NaN for masked pixels. |
 | `M` | `I` | Spectral order number (see below). -1 if unknown. |
 | `GROUP` | `16A` | Group identifier ('A', 'B', 'cal', or bundle index). |
 | `FIBER_IDX` | `I` | Fiber index within group (1-indexed). -1 if unknown. |
@@ -73,12 +73,28 @@ Each row corresponds to one extracted trace/order.
 Invalid pixels are marked with `NaN` in the `SPEC` and `SIG` columns. This
 replaces the separate `COLUMNS` array used in the legacy format.
 
+### Spectral covariance (v3)
+
+When extraction receives a detector `variance` image, each `Spectrum.covariance`
+is a SciPy CSR matrix in squared flux units. `SIG**2` is its diagonal; masked
+samples have NaN diagonals. Covariance includes the fitted spatial profile and
+common detector pixels in overlapping swaths. See
+[Extraction uncertainty](extraction_uncertainty.md) for its statistical scope.
+
+Each available covariance is saved in a `COV0000`, `COV0001`, ... binary-table
+extension. Header `SPINDEX` selects the zero-based row in `SPECTRA` and `NCOL`
+gives its square dimension. The single table row stores variable-length
+`DATA` (float64), `INDICES` (int32), and `INDPTR` (int32) arrays, directly
+representing CSR storage. Missing covariance extensions mean no covariance was
+provided; a diagonal matrix is not manufactured. Versions 1 and 2 remain
+readable. Continuum normalization scales both covariance axes.
+
 ### Reading Spectra
 
 ```python
 from pyreduce.spectra import Spectra
 
-# Load spectra (handles both v2 and legacy formats)
+# Load spectra (handles v3, v2 and legacy formats)
 spectra = Spectra.read("observation.science.fits")
 
 # Access individual spectra
@@ -109,9 +125,9 @@ The binary table has a single row containing flattened 2D arrays:
 
 The `TDIM` keyword stores the original shape as `(ncol, ntrace)`.
 
-### Key Differences from v2
+### Key Differences from Current Format
 
-| Aspect | Legacy (v1) | Current (v2) |
+| Aspect | Legacy (v1) | Current (v3) |
 |--------|-------------|--------------|
 | Table rows | 1 (flattened) | ntrace (one per spectrum) |
 | Masking | Separate `COLUMNS` array | NaN in data |

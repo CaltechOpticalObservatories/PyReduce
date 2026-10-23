@@ -275,6 +275,7 @@ def _slitdec_core(
     runs along the slit first, as the C's zeta layout does, and are then
     permuted into runs of equal sL window base.
     """
+    original_mask = maskT.copy()
     sP_stop = 5e-5  # 99th percentile spectrum change relative to median
     sP_change = np.inf
 
@@ -448,7 +449,7 @@ def _slitdec_core(
         good = maskT[core] != 0
         dev = np.sqrt(np.sum(resid * resid, where=good) / np.count_nonzero(good))
         if kappa > 0:
-            maskT[core] = np.abs(resid) < kappa * dev
+            maskT[core] = original_mask[core] & (np.abs(resid) <= kappa * dev)
 
         prev = it
         it += 1

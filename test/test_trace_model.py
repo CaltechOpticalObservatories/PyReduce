@@ -328,7 +328,7 @@ class TestSaveLoadRoundtrip:
         save_traces(path, [minimal_trace])
         _, header = load_traces(path)
 
-        assert header["E_FMTVER"] == 4
+        assert header["E_FMTVER"] == 5
 
 
 class TestLegacyNpzLoading:
@@ -595,3 +595,21 @@ class TestEdgeCases:
 
         wlen_after = trace_loaded.wlen(x)
         np.testing.assert_array_almost_equal(wlen_before, wlen_after)
+
+
+@pytest.mark.unit
+def test_residual_coordinates_roundtrip_at_double_precision(tmp_path):
+    coordinates = np.array([-20., -.12345678901234, 0., 20.])
+    residual = np.array([.12345678901234, -.01987654321098, .000123456789, .27])
+    traces = [Trace(m=90, pos=np.array([0., 40.]), column_range=(0, 100), slitdelta=residual, slitdelta_y=coordinates),
+              Trace(m=91, pos=np.array([0., 60.]), column_range=(0, 100), slitdelta=residual[:2], slitdelta_y=coordinates[:2]/2)]
+    path = tmp_path/'physical_residual.fits'
+    save_traces(path, traces)
+    restored, _ = load_traces(path)
+    for before, after in zip(traces, restored):
+        np.testing.assert_array_equal(after.slitdelta, before.slitdelta)
+        np.testing.assert_array_equal(after.slitdelta_y, before.slitdelta_y)
+    with fits.open(path) as hdus:
+        assert hdus[1].columns['SLITDELTA'].format.endswith('D')
+        assert hdus[1].columns['SLITDELTA_Y'].format.endswith('D')
+        assert hdus[1].columns['SLITDELTA_Y'].unit == 'pixel'

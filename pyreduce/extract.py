@@ -152,15 +152,15 @@ def _slitdec_charslit(
     mask : array[nrows, ncols]
         Output mask (True = bad)
     info : array[5]
-        [success, chi2, status, niter, delta_x]
+        [success, spectrum_change, status, niter, delta_x]
     """
     nrows, ncols = img.shape
 
     # Get data and mask
     mask_in = np.ma.getmaskarray(img)
     data = np.ma.getdata(img).astype(np.float64)
-    data[~np.isfinite(data)] = 0
     mask_in = mask_in | ~np.isfinite(data)
+    data[mask_in] = 0
 
     # Compute pixel uncertainties (shot noise)
     pix_unc = np.abs(data) * gain
@@ -217,7 +217,7 @@ def _slitdec_charslit(
     mask_out = result.get("mask", mask_c)
     mask_out = mask_out == 0
 
-    # Build info array: charslit returns info as [success, cost, status, iter, delta_x]
+    # Build info array: charslit returns info as [success, spectrum_change, status, iter, delta_x]
     if isinstance(info_arr, np.ndarray) and len(info_arr) >= 5:
         info = info_arr
     else:
@@ -412,6 +412,7 @@ class ProgressPlot:  # pragma: no cover
         save=True,
         slitcurve=None,
         slitdeltas=None,
+        slitdelta_y=None,
     ):
         if self.closed:
             return
@@ -432,6 +433,7 @@ class ProgressPlot:  # pragma: no cover
                 info=info,
                 slitcurve=slitcurve,
                 slitdeltas=slitdeltas,
+                slitdelta_y=slitdelta_y,
             )
 
         img = np.copy(img)
@@ -441,8 +443,8 @@ class ProgressPlot:  # pragma: no cover
 
         ny = img.shape[0]
         nspec = img.shape[1]
-        x_spec, y_spec = self.get_spec(img, spec, slitf, ycen, slitcurve, slitdeltas)
-        x_slit, y_slit = self.get_slitf(img, spec, slitf, ycen, slitcurve, slitdeltas)
+        x_spec, y_spec = self.get_spec(img, spec, slitf, ycen, slitcurve, slitdeltas, slitdelta_y)
+        x_slit, y_slit = self.get_slitf(img, spec, slitf, ycen, slitcurve, slitdeltas, slitdelta_y)
         ycen = ycen + ny / 2
 
         old = np.linspace(-1, ny, len(slitf)) + 0.5
@@ -563,7 +565,7 @@ class ProgressPlot:  # pragma: no cover
         plt.ioff()
         plt.close()
 
-    def get_spec(self, img, spec, slitf, ycen, slitcurve=None, slitdeltas=None):
+    def get_spec(self, img, spec, slitf, ycen, slitcurve=None, slitdeltas=None, slitdelta_y=None):
         """get the spectrum corrected by the slit function"""
         nrow, ncol = img.shape
         row_idx, col_idx = np.indices(img.shape)
@@ -587,12 +589,12 @@ class ProgressPlot:  # pragma: no cover
             for i in range(1, min(6, slitcurve.shape[1])):
                 delta += slitcurve[:, i] * (t**i)
             if slitdeltas is not None:
-                delta += slitdeltas[:, np.newaxis]
+                delta += np.interp(t, slitdelta_y, slitdeltas, left=0, right=0)
             col_pos = col_pos - delta
 
         return col_pos.ravel(), spec_val.ravel()
 
-    def get_slitf(self, img, spec, slitf, ycen, slitcurve=None, slitdeltas=None):
+    def get_slitf(self, img, spec, slitf, ycen, slitcurve=None, slitdeltas=None, slitdelta_y=None):
         """get the slit function"""
         nrow, ncol = img.shape
         row_idx, col_idx = np.indices(img.shape)
@@ -610,7 +612,7 @@ class ProgressPlot:  # pragma: no cover
             for i in range(1, min(6, slitcurve.shape[1])):
                 delta += slitcurve[:, i] * (t**i)
             if slitdeltas is not None:
-                delta += slitdeltas[:, np.newaxis]
+                delta += np.interp(t, slitdelta_y, slitdeltas, left=0, right=0)
             col_eff = col_eff - delta
 
         # Handle zeros in spectrum
@@ -1104,6 +1106,9 @@ def extract_spectrum(
     progress=None,
     ord_num=0,
     preset_slitfunc=None,
+    variance=None,
+    out_covariance=None,
+    slitdelta_y=None,
     **kwargs,
 ):
     """
@@ -1164,8 +1169,8 @@ def extract_spectrum(
     curvature : array[ncol, n_coeffs], optional
         Slit curvature polynomial coefficients for this trace (default: None, i.e. vertical extraction)
     slitdeltas : array[nrows_stored], optional
-        Per-row residual offsets from polynomial curvature fit (default: None).
-        Will be interpolated to match swath nrows if lengths differ.
+        Residual x offsets on the physical pixel grid slitdelta_y (default: None).
+        Outside the calibrated range only the polynomial curvature is applied.
     plot : bool, optional
         wether to plot the progress, plotting will slow down the procedure significantly (default: False)
     ord_num : int, optional
@@ -1211,6 +1216,7 @@ def extract_spectrum(
     nswath = 2 * nbin - 1
     swath = Swath(nswath)
     margin = np.zeros((nswath, 2), int)
+    uncertainty_inputs = []
 
     if normalize:
         norm_img = [None] * nswath
@@ -1258,15 +1264,16 @@ def extract_spectrum(
 
             # Prepare curvature for the backends and visualization
             slitcurve = _ensure_slitcurve(swath_curv, swath_ncols)
-            if _use_deltas() and slitdeltas is not None and len(slitdeltas) > 0:
-                # Interpolate slitdeltas to match swath nrows if needed
-                if len(slitdeltas) == swath_nrows:
-                    swath_slitdeltas = slitdeltas.astype(np.float64)
-                else:
-                    x_stored = np.linspace(0, 1, len(slitdeltas))
-                    x_swath = np.linspace(0, 1, swath_nrows)
-                    swath_slitdeltas = np.interp(x_swath, x_stored, slitdeltas)
-                    swath_slitdeltas = swath_slitdeltas.astype(np.float64)
+            if _use_deltas() and slitdeltas is not None and np.any(slitdeltas):
+                if slitdelta_y is None:
+                    raise ValueError("Nonzero slitdelta requires physical slitdelta_y coordinates; recalibrate legacy curvature products")
+                if np.any(~np.isfinite(slitdelta_y)) or np.any(np.diff(slitdelta_y) <= 0):
+                    raise ValueError("slitdelta_y must contain increasing finite pixel offsets")
+                # zeta_tensors evaluates its polynomial at this same offset for
+                # subpixel index iy: t = iy/osample - nrows//2 - 1 - 1/osample.
+                # Pass the full subpixel array, avoiding backend aperture rescaling.
+                subpixel_y = np.arange(nslitf)/osample - swath_nrows//2 - 1 - 1/osample
+                swath_slitdeltas = np.interp(subpixel_y, slitdelta_y, slitdeltas, left=0, right=0)
             else:
                 swath_slitdeltas = None
 
@@ -1289,7 +1296,11 @@ def extract_spectrum(
                 reject_threshold=reject_threshold,
                 preset_slitfunc=preset_slitfunc,
             )
-            t.set_postfix(chi=f"{swath[ihalf][5][1]:1.2f}")
+            if variance is not None:
+                if not swath.info[ihalf][0] and swath.info[ihalf][2] != -1:
+                    raise RuntimeError(f"Slit decomposition failed for trace {ord_num}, columns {ibeg}:{iend}: {swath.info[ihalf]}")
+                uncertainty_inputs.append((swath_img.copy(), index, swath_ycen_abs.copy(), slitcurve, charslit_slitdeltas))
+            t.set_postfix(spectrum_change=f"{swath[ihalf][5][1]:.3g}")
 
             if normalize:
                 # Save image and model for later
@@ -1328,7 +1339,8 @@ def extract_spectrum(
                     swath.info[ihalf],
                     ihalf,
                     slitcurve=slitcurve,
-                    slitdeltas=swath_slitdeltas,
+                    slitdeltas=slitdeltas if swath_slitdeltas is not None else None,
+                    slitdelta_y=slitdelta_y,
                 )
 
     # Remove points at the border of the each swath, if order has curvature
@@ -1370,10 +1382,59 @@ def extract_spectrum(
     mask[: xrange[0]] = True
     mask[xrange[1] :] = True
 
+    if variance is not None:
+        from .extraction_uncertainty import slit_response, combine_swath_covariance
+
+        # Responses share the original detector-pixel indexing, so overlap
+        # covariance is retained before constructing the order covariance.
+        def swath_responses():
+            supported = np.zeros(ncol, dtype=bool)
+            for i, (ibeg, iend) in enumerate(zip(bins_start, bins_end, strict=False)):
+                image, index, centers, curve, deltas = uncertainty_inputs[i]
+                good = ~swath.mask[i] & ~np.ma.getmaskarray(image) & np.isfinite(np.ma.getdata(image))
+                clean = np.ma.getdata(image).copy()
+                clean[~good] = 0
+                fitted, profile, response = slit_response(clean, good, centers, curve, deltas, swath.slitf[i], osample, lambda_sf, lambda_sp, preset=preset_slitfunc is not None)
+                if reject_threshold > 0:
+                    # Newton refines the same fixed point with a fixed mask.
+                    # Verify that its model also reproduces the native rejection
+                    # rule before accepting that mask for uncertainty propagation.
+                    fixed_image = np.ma.array(np.ma.getdata(image), mask=~good)
+                    _, _, fixed_model, _, _, _ = _slitdec_charslit(fixed_image, centers, curve, deltas, lambda_sp, lambda_sf, osample, yrange, 1, gain, 0, profile)
+                    residual = fixed_model - np.ma.getdata(image)
+                    edge = int(swath.info[i][4])
+                    core = np.zeros_like(good)
+                    core[:, edge:image.shape[1]-edge] = True
+                    deviation = np.sqrt(np.mean(residual[good & core]**2))
+                    input_good = ~np.ma.getmaskarray(image) & np.isfinite(np.ma.getdata(image))
+                    refined_good = input_good & (np.abs(residual) <= reject_threshold*deviation)
+                    if np.any((refined_good != good) & core):
+                        raise RuntimeError(f"Slit rejection mask changed after fixed-point refinement for trace {ord_num}, columns {ibeg}:{iend}")
+                if not swath.info[i][0]:
+                    cancellation = np.sum(np.abs(profile))/np.abs(np.sum(profile))
+                    logger.warning("Trace %s columns %s:%s reached its native iteration limit; Newton completed the same fit with a stable rejection mask. Profile absolute/signed sum ratio %.3g", ord_num, ibeg, iend, cancellation)
+                swath.spec[i] = fitted
+                swath.slitf[i] = profile
+                response *= weight[i][:, None]
+                measured = np.any(response != 0, axis=1)
+                supported[ibeg:iend] |= measured
+                pixels = np.ravel_multi_index(index[::-1], img.T.shape).T.ravel()
+                yield np.arange(ibeg, iend)[measured], pixels, response[measured]
+            mask[~supported] = True
+
+        covariance = combine_swath_covariance(swath_responses(), variance.T.ravel(), ncol)
+        diagonal = covariance.diagonal()
+        diagonal[mask] = np.nan
+        covariance.setdiag(diagonal)
+        np.ma.getdata(sunc)[:] = np.sqrt(diagonal)
+        if out_covariance is not None:
+            out_covariance.append(covariance)
+
     # Apply weights
     for i, (ibeg, iend) in enumerate(zip(bins_start, bins_end, strict=False)):
         spec[ibeg:iend] += swath.spec[i] * weight[i]
-        sunc[ibeg:iend] += swath.unc[i] * weight[i]
+        if variance is None:
+            sunc[ibeg:iend] += swath.unc[i] * weight[i]
 
     if normalize:
         for i, (ibeg, iend) in enumerate(zip(bins_start, bins_end, strict=False)):
@@ -1382,7 +1443,8 @@ def extract_spectrum(
             im_ordr[index] += norm_model[i] * weight[i]
 
     slitf[:] = np.mean(swath.slitf, axis=0)
-    sunc[:] = np.sqrt(sunc**2 + (readnoise / gain) ** 2)
+    if variance is None:
+        np.ma.getdata(sunc)[:] = np.sqrt(np.ma.getdata(sunc)**2 + (readnoise / gain) ** 2)
     return spec, slitf, mask, sunc
 
 
@@ -1444,6 +1506,7 @@ def optimal_extraction(
     slitdeltas=None,
     plot=False,
     plot_title=None,
+    slitdelta_y=None,
     **kwargs,
 ):
     """Use optimal extraction to get spectra
@@ -1534,6 +1597,7 @@ def optimal_extraction(
             column_range[i],
             curvature=trace_curv,
             slitdeltas=trace_slitdeltas,
+            slitdelta_y=slitdelta_y[i] if slitdelta_y is not None else None,
             out_spec=spectrum[i],
             out_sunc=uncertainties[i],
             out_slitf=slitfunction[i],
@@ -1791,6 +1855,7 @@ def extract(
     traces: list[Trace],
     extraction_height: float = 0.5,
     extraction_type: str = "optimal",
+    variance=None,
     **kwargs,
 ) -> list[Spectrum]:
     """
@@ -1807,6 +1872,11 @@ def extract(
         values above are pixels. If None, falls back to trace.height. (default: 0.5)
     extraction_type : {"optimal", "simple"}, optional
         Extraction algorithm. (default: "optimal")
+    variance : array[nrow, ncol], optional
+        Detector variance in squared image units, including background subtraction.
+        The optimal fit propagates it through its fitted profile and overlapping
+        swaths; each Spectrum then carries covariance as a CSR matrix.
+        Without it, the existing residual-based uncertainties are returned.
     **kwargs
         Additional parameters for extraction functions (osample, lambda_sf, etc.)
 
@@ -1815,6 +1885,17 @@ def extract(
     list[Spectrum]
         Extracted spectrum objects, one per trace.
     """
+    if variance is not None:
+        if extraction_type != "optimal":
+            raise ValueError("Pixel variance propagation is implemented for optimal extraction")
+        if variance.shape != img.shape:
+            raise ValueError("variance must have the same shape as img")
+        good = ~np.ma.getmaskarray(img) & np.isfinite(np.ma.getdata(img))
+        if np.any(~np.isfinite(variance[good])) or np.any(variance[good] < 0):
+            raise ValueError("Unmasked detector variances must be finite and nonnegative")
+        variance = np.array(variance, dtype=np.float64, copy=True)
+        variance[~good] = 0
+    covariances = []
     if len(traces) == 0:
         return []
 
@@ -1865,17 +1946,8 @@ def extract(
                         if coeffs is not None:
                             curvature[i, j, : len(coeffs)] = coeffs
 
-    # Build slitdeltas array from Trace.slitdelta
-    slitdeltas = None
-    if any(t.slitdelta is not None for t in valid_traces):
-        max_len = max(
-            (len(t.slitdelta) if t.slitdelta is not None else 0) for t in valid_traces
-        )
-        if max_len > 0:
-            slitdeltas = np.zeros((ntrace, max_len), dtype=np.float32)
-            for i, t in enumerate(valid_traces):
-                if t.slitdelta is not None:
-                    slitdeltas[i, : len(t.slitdelta)] = t.slitdelta
+    slitdeltas = [t.slitdelta for t in valid_traces]
+    slitdelta_y = [t.slitdelta_y for t in valid_traces]
 
     # Fix the input parameters
     heights, column_range, traces_arr = fix_parameters(
@@ -1891,6 +1963,9 @@ def extract(
             column_range,
             curvature=curvature,
             slitdeltas=slitdeltas,
+            slitdelta_y=slitdelta_y,
+            variance=variance,
+            out_covariance=covariances,
             **kwargs,
         )
     elif extraction_type in ("simple", "arc"):
@@ -1927,6 +2002,7 @@ def extract(
                 wave=wave,
                 slitfu=slitfu,
                 extraction_height=heights[i],
+                covariance=covariances[i] if variance is not None else None,
             )
         )
 
@@ -2006,17 +2082,8 @@ def extract_normalize(
                         if coeffs is not None:
                             curvature[i, j, : len(coeffs)] = coeffs
 
-    # Build slitdeltas array
-    slitdeltas = None
-    if any(t.slitdelta is not None for t in traces):
-        max_len = max(
-            (len(t.slitdelta) if t.slitdelta is not None else 0) for t in traces
-        )
-        if max_len > 0:
-            slitdeltas = np.zeros((ntrace, max_len), dtype=np.float32)
-            for i, t in enumerate(traces):
-                if t.slitdelta is not None:
-                    slitdeltas[i, : len(t.slitdelta)] = t.slitdelta
+    slitdeltas = [t.slitdelta for t in traces]
+    slitdelta_y = [t.slitdelta_y for t in traces]
 
     # Fix parameters
     heights, column_range, traces_arr = fix_parameters(
@@ -2034,6 +2101,7 @@ def extract_normalize(
         column_range,
         curvature=curvature,
         slitdeltas=slitdeltas,
+        slitdelta_y=slitdelta_y,
         normalize=True,
         im_norm=im_norm,
         im_ordr=im_ordr,

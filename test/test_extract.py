@@ -614,6 +614,7 @@ class TestSlitdeltasExtraction:
             yrange,
             xrange,
             slitdeltas=slitdeltas,
+            slitdelta_y=np.linspace(-5, 5, len(slitdeltas)),
             osample=1,
         )
 
@@ -639,6 +640,7 @@ class TestSlitdeltasExtraction:
             yrange,
             xrange,
             slitdeltas=slitdeltas,
+            slitdelta_y=np.linspace(-5, 5, len(slitdeltas)),
             osample=1,
         )
 
@@ -686,6 +688,7 @@ class TestSlitdeltasExtraction:
             extraction_height,
             column_range,
             slitdeltas=slitdeltas,
+            slitdelta_y=np.linspace(-5, 5, 10)[None],
             osample=1,
         )
 
@@ -706,6 +709,7 @@ class TestSlitdeltasExtraction:
                 pos=np.array([0.0, 25.0]),
                 column_range=(0, ncol),
                 slitdelta=slitdelta,
+                slitdelta_y=np.linspace(-5, 5, len(slitdelta)),
             )
         ]
 
@@ -800,6 +804,7 @@ class TestTraceCurvatureExtraction:
                 column_range=(0, ncol),
                 slit=slit,
                 slitdelta=slitdelta,
+                slitdelta_y=np.linspace(-5, 5, len(slitdelta)),
             )
         ]
 
@@ -1045,3 +1050,46 @@ class TestTraceCurvatureExtraction:
         assert spectra[0].wave is not None
         assert spectra[0].wave[0] == pytest.approx(5000.0)
         assert spectra[0].wave[99] == pytest.approx(5000.0 + 0.5 * 99)
+
+
+@pytest.mark.parametrize("backend", ["c", "numpy"])
+@pytest.mark.parametrize("nrows", [10, 40])
+@pytest.mark.parametrize("phase", [.13, .67])
+def test_physical_residual_and_polynomial_describe_same_displacement(monkeypatch, backend, nrows, phase):
+    # A measured linear residual is the same geometry as a polynomial slope,
+    # even when a narrow science aperture uses a much wider calibration grid.
+    monkeypatch.setenv("PYREDUCE_EXTRACTION", backend)
+    monkeypatch.setenv("PYREDUCE_USE_DELTAS", "1")
+    yy, xx = np.indices((80, 80))
+    image = 300*np.exp(-.5*((yy-40-phase-1.3)/1.)**2)*np.exp(-.5*((xx-39.2-.04*(yy-40-phase))/1.8)**2)+1
+    curve = np.zeros((80, 2))
+    curve[:, 1] = .04
+    measured_y = np.arange(-25., 26.)
+    settings = dict(osample=4, swath_width=80, lambda_sf=.1, lambda_sp=0, maxiter=100, reject_threshold=0)
+    polynomial = extract.extract_spectrum(image.copy(), np.full(80, 40+phase), (nrows//2, (nrows-1)//2), np.array([0, 80]), curvature=curve, **settings)
+    residual = extract.extract_spectrum(image.copy(), np.full(80, 40+phase), (nrows//2, (nrows-1)//2), np.array([0, 80]), slitdeltas=.04*measured_y, slitdelta_y=measured_y, **settings)
+    np.testing.assert_allclose(residual[0][10:70], polynomial[0][10:70], rtol=1e-10, atol=1e-9)
+
+
+def test_nonzero_legacy_residual_requires_physical_coordinates():
+    image = np.ones((30, 60))
+    args = (image, np.full(60, 15.2), (5, 4), np.array([0, 60]))
+    with pytest.raises(ValueError, match="physical slitdelta_y"):
+        extract.extract_spectrum(*args, slitdeltas=np.array([.1, -.1]))
+    result = extract.extract_spectrum(*args, slitdeltas=np.zeros(2), reject_threshold=0)
+    assert np.all(np.isfinite(result[0]))
+
+
+@pytest.mark.parametrize("method", ["get_spec", "get_slitf"])
+def test_progress_plot_uses_physical_residual_offsets(method):
+    display = extract.ProgressPlot.__new__(extract.ProgressPlot)
+    image = np.full((10, 40), 3.)
+    curve = np.zeros((40, 2))
+    curve[:, 1] = .02
+    ycen = 5.13+np.arange(40)*.01
+    spectrum = np.linspace(5., 10., 40)
+    slit = np.ones(49)
+    calculate = getattr(display, method)
+    polynomial = calculate(image, spectrum, slit, ycen, curve)
+    measured = calculate(image, spectrum, slit, ycen, np.zeros_like(curve), np.array([-.4, .4]), np.array([-20., 20.]))
+    np.testing.assert_allclose(measured, polynomial, atol=1e-13)
