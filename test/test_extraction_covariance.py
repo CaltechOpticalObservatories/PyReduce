@@ -99,7 +99,8 @@ def test_permanent_bad_pixels_cannot_be_revived(backend):
     assert result["mask"].sum() > image.size*.9
 
 
-def test_public_variance_path_and_covariance_roundtrip(tmp_path):
+@pytest.mark.parametrize("suffix", [".fits", ".fits.gz"])
+def test_public_variance_path_and_covariance_roundtrip(tmp_path, suffix):
     yy, xx = np.indices((20, 100))
     centers = 10.2 + .004*xx
     image = 200*(ndtr((yy+.5-centers)/1.1)-ndtr((yy-.5-centers)/1.1))
@@ -112,7 +113,7 @@ def test_public_variance_path_and_covariance_roundtrip(tmp_path):
     np.testing.assert_allclose(result.sig**2, result.covariance.diagonal(), equal_nan=True)
     assert np.any(result.covariance.diagonal(1) != 0)
     result.cont = np.full(len(result.spec), 2.)
-    filename = tmp_path/'covariance.fits'
+    filename = tmp_path/f'covariance{suffix}'
     Spectra(fits.Header({"BUNIT": "electron", "COVUNIT": "electron2"}), [result]).save(filename)
     with fits.open(filename) as hdus:
         assert hdus["SPECTRA"].header["TUNIT1"] == "electron"
@@ -184,6 +185,33 @@ def test_unsettled_rejection_mask_cannot_supply_covariance():
         extract(image, [trace], extraction_height=9, variance=np.full_like(image, .04), osample=3, swath_width=80, lambda_sf=.1, lambda_sp=0, reject_threshold=2, maxiter=1)
 
 
+def test_refined_rejection_covariance_matches_pixel_perturbation():
+    yy, xx = np.indices((24, 80))
+    image = 200*(ndtr((yy+.5-12.2)/1.1)-ndtr((yy-.5-12.2)/1.1))
+    image += np.random.default_rng(82).normal(0, .2, image.shape)
+    # Only this pixel is stochastic for the conditional response check.
+    variance = np.zeros_like(image)
+    variance[13, 40] = .04
+
+    def fit(offset):
+        perturbed = image.copy()
+        perturbed[13, 40] += offset
+        trace = Trace(m=9, pos=np.array([0., 12.2]), column_range=(0, 80), height=9)
+        result, = extract(perturbed, [trace], extraction_height=9, variance=variance, osample=3, swath_width=80, lambda_sf=.1, lambda_sp=0, reject_threshold=2, maxiter=100)
+        return result
+
+    result = fit(0)
+    step = 1e-4
+    plus, minus = fit(step), fit(-step)
+    good = ~result.mask
+    assert good[40]
+    assert result.sig[40] > 0
+    derivative = (plus.spec[good]-minus.spec[good])/(2*step)
+    covariance = result.covariance.toarray()[np.ix_(good, good)]
+    np.testing.assert_allclose(covariance, .04*np.outer(derivative, derivative), rtol=2e-5, atol=1e-8)
+    np.testing.assert_allclose(result.sig[good]**2, np.diag(covariance))
+
+
 def test_faint_uvb_profile_refinement_and_pixel_response():
     # A saved 20-day UVB swath where Newton cycled despite native convergence.
     with np.load(Path(__file__).parent/'data/extraction_covariance/uvb20_swath.npz') as archive:
@@ -201,3 +229,18 @@ def test_faint_uvb_profile_refinement_and_pixel_response():
     numerical = (plus-minus)/(2*step)
     np.testing.assert_allclose(response @ perturbation.T.ravel(), numerical, rtol=2e-4, atol=2e-6)
     assert np.all(response[:, ~inputs['good'].T.ravel()] == 0)
+
+
+@pytest.mark.parametrize("preset", [False, True])
+def test_deferred_covariance_response_preserves_fitted_spectrum(preset):
+    image, centers, curve, delta, spectrum, slit, osample = curved_swath()
+    image += np.random.default_rng(11).normal(0, .2, image.shape)
+    good = np.ones_like(image, dtype=bool)
+    good[3, 15] = False
+    arguments = (image, good, centers, curve, delta, slit, osample, .1, .02)
+    fitted, profile, response = slit_response(*arguments, preset=preset)
+    deferred, deferred_profile, absent = slit_response(*arguments, preset=preset, compute_response=False)
+    np.testing.assert_array_equal(deferred, fitted)
+    np.testing.assert_array_equal(deferred_profile, profile)
+    assert absent is None
+    assert np.all(np.isfinite(response))

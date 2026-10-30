@@ -1391,14 +1391,17 @@ def extract_spectrum(
             supported = np.zeros(ncol, dtype=bool)
             for i, (ibeg, iend) in enumerate(zip(bins_start, bins_end, strict=False)):
                 image, index, centers, curve, deltas = uncertainty_inputs[i]
-                good = ~swath.mask[i] & ~np.ma.getmaskarray(image) & np.isfinite(np.ma.getdata(image))
-                clean = np.ma.getdata(image).copy()
-                clean[~good] = 0
-                fitted, profile, response = slit_response(clean, good, centers, curve, deltas, swath.slitf[i], osample, lambda_sf, lambda_sp, preset=preset_slitfunc is not None)
-                if reject_threshold > 0:
-                    # Newton refines the same fixed point with a fixed mask.
-                    # Verify that its model also reproduces the native rejection
-                    # rule before accepting that mask for uncertainty propagation.
+                input_good = ~np.ma.getmaskarray(image) & np.isfinite(np.ma.getdata(image))
+                good = ~swath.mask[i] & input_good
+                profile = swath.slitf[i]
+                for _ in range(maxiter):
+                    clean = np.ma.getdata(image).copy()
+                    clean[~good] = 0
+                    fitted, profile, response = slit_response(clean, good, centers, curve, deltas, profile, osample, lambda_sf, lambda_sp, preset=preset_slitfunc is not None, compute_response=reject_threshold <= 0)
+                    if reject_threshold <= 0:
+                        break
+                    # Refinement can move pixels across the native clipping
+                    # threshold. Refit until that same rule leaves the mask fixed.
                     fixed_image = np.ma.array(np.ma.getdata(image), mask=~good)
                     _, _, fixed_model, _, _, _ = _slitdec_charslit(fixed_image, centers, curve, deltas, lambda_sp, lambda_sf, osample, yrange, 1, gain, 0, profile)
                     residual = fixed_model - np.ma.getdata(image)
@@ -1406,10 +1409,15 @@ def extract_spectrum(
                     core = np.zeros_like(good)
                     core[:, edge:image.shape[1]-edge] = True
                     deviation = np.sqrt(np.mean(residual[good & core]**2))
-                    input_good = ~np.ma.getmaskarray(image) & np.isfinite(np.ma.getdata(image))
                     refined_good = input_good & (np.abs(residual) <= reject_threshold*deviation)
-                    if np.any((refined_good != good) & core):
-                        raise RuntimeError(f"Slit rejection mask changed after fixed-point refinement for trace {ord_num}, columns {ibeg}:{iend}")
+                    if not np.any((refined_good != good) & core):
+                        break
+                    good[core] = refined_good[core]
+                else:
+                    raise RuntimeError(f"Slit rejection mask changed after fixed-point refinement for trace {ord_num}, columns {ibeg}:{iend}")
+                if reject_threshold > 0:
+                    fitted, profile, response = slit_response(clean, good, centers, curve, deltas, profile, osample, lambda_sf, lambda_sp, preset=preset_slitfunc is not None)
+                swath.mask[i] = ~good
                 if not swath.info[i][0]:
                     cancellation = np.sum(np.abs(profile))/np.abs(np.sum(profile))
                     logger.warning("Trace %s columns %s:%s reached its native iteration limit; Newton completed the same fit with a stable rejection mask. Profile absolute/signed sum ratio %.3g", ord_num, ibeg, iend, cancellation)

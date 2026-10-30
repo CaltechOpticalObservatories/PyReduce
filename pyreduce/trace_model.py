@@ -210,7 +210,7 @@ def _validate_traces(traces: list[Trace], context: str = "") -> None:
     Checks:
     1. (m, bundle, group) is unique for grouped traces (group is not None)
     2. (m, bundle, fiber_idx) is unique for individual fiber traces
-    3. Traces are ordered by y-position (ascending)
+    3. Ungrouped traces have consistent spatial ordering over their shared columns
 
     Parameters
     ----------
@@ -269,23 +269,22 @@ def _validate_traces(traces: list[Trace], context: str = "") -> None:
                 )
             seen_fiber.add(key)
 
-    # Check y-position ordering (evaluate at midpoint of column range)
-    # Only applies to ungrouped traces - grouped traces are organized by (m, group)
-    has_groups = any(t.group is not None for t in traces)
-    if not has_groups:
-        ref_x = (traces[0].column_range[0] + traces[0].column_range[1]) // 2
-        y_positions = [t.y_at_x(ref_x) for t in traces]
-        for i in range(1, len(y_positions)):
-            if y_positions[i] < y_positions[i - 1]:
-                logger.warning(
-                    "Traces not ordered by y-position at x=%d: trace %d (y=%.1f) < trace %d (y=%.1f)%s",
-                    ref_x,
-                    i,
-                    y_positions[i],
-                    i - 1,
-                    y_positions[i - 1],
-                    context,
-                )
+    # Physical-order numbering can run in either spatial direction. Evaluate
+    # only shared measured columns; extrapolated trace ends are not geometry.
+    if not any(t.group is not None for t in traces):
+        direction = None
+        for i, (previous, current) in enumerate(zip(traces[:-1], traces[1:]), 1):
+            first = max(previous.column_range[0], current.column_range[0])
+            last = min(previous.column_range[1], current.column_range[1])
+            if first >= last:
+                continue
+            x = np.arange(first, last)
+            separation = current.y_at_x(x) - previous.y_at_x(x)
+            sign = 1 if np.all(separation > 0) else -1 if np.all(separation < 0) else 0
+            if sign == 0 or (direction is not None and sign != direction):
+                logger.warning("Inconsistent spatial ordering of traces %d and %d over columns %d:%d%s", i-1, i, first, last, context)
+            elif direction is None:
+                direction = sign
 
 
 def save_traces(
@@ -557,7 +556,8 @@ def load_traces(path: str | Path) -> tuple[list[Trace], fits.Header]:
             )
 
             # Remove trailing NaN/zeros from pos
-            pos = pos_arr[i]
+            # FITS returns a scalar for a one-coefficient (constant) trace.
+            pos = np.atleast_1d(pos_arr[i])
             pos = pos[~np.isnan(pos)] if np.any(np.isnan(pos)) else pos
 
             column_range = (int(col_range_arr[i, 0]), int(col_range_arr[i, 1]))

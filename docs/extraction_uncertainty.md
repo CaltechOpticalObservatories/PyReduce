@@ -58,8 +58,9 @@ and spectral tolerance. This handles a faint UVB swath where Newton cycles;
 in that swath the native fit stops at 967 iterations, so increasing its limit
 does not repair refinement. The saved regression fixture checks the converged
 response against independently refitted positive and negative pixel
-perturbations. Non-convergence still raises, and extraction still verifies
-that refinement has not changed the native rejection mask.
+perturbations. Refinement can move pixels across the native rejection threshold
+even after native convergence. Extraction then applies the same clipping rule
+and refits until the fit and mask agree; non-convergence still raises.
 
 In the preserved faint BLUE
 34-order experiment this reduced full-arm extraction from 92 to 38 seconds,
@@ -130,9 +131,13 @@ below `5e-5 * abs(median(spectrum))`. Near a zero median this can converge very
 slowly. A finite native result that reaches only the iteration limit may proceed
 to the same-equation Newton refinement already required for its response. Other
 native failures still fail immediately. After refinement, a single native solve
-with the refined profile reconstructs the detector model; applying the original
-rejection rule must leave its mask unchanged. A changed mask fails explicitly.
-This consistency check also applies to normally converged native fits.
+with the refined profile reconstructs the detector model. If the original
+rejection rule changes the mask, the fixed-point fit is recomputed with that
+updated mask. The full pixel response is constructed once the mask is stable.
+The same configured `maxiter` bounds these rejection updates; a mask that remains unsettled fails explicitly. Permanent bad pixels
+and native edge exclusions stay excluded. Covariance is accepted only when the
+refined model leaves the rejection mask unchanged. This consistency check also
+applies to normally converged native fits.
 
 An unconstrained fitted profile can contain large positive and negative
 components when the source is undetected. Numerical convergence does not turn
