@@ -213,7 +213,7 @@ class Curvature:
                 # Row position follows trace + offset
                 row = ycen_int + offset
                 # Check bounds
-                if np.any(row < 0) or np.any(row >= nrow):
+                if np.any(row[cr[0]:cr[1]] < 0) or np.any(row[cr[0]:cr[1]] >= nrow):
                     continue
                 # Direct indexing along the curved trace
                 spectra[i, cr[0] : cr[1]] = original[
@@ -224,19 +224,19 @@ class Curvature:
 
         # General case: extract and collapse multiple rows per offset
         n_offsets = max(1, int(curve_xwd // xwd))
-        offsets = (np.arange(n_offsets) - (n_offsets - 1) / 2) * xwd
+        row_offsets = np.arange(n_offsets) * xwd - n_offsets*xwd//2
+        offsets = row_offsets + (xwd-1)/2
 
         spectra = np.ma.zeros((n_offsets, ncol))
         spectra[:, :] = np.ma.masked
 
-        half = xwd // 2
-        for i, offset in enumerate(offsets):
-            # Y bounds for this offset spectrum
-            yb = ycen_int + int(offset) - half
+        for i, row_offset in enumerate(row_offsets):
+            # Physical row centers must match the pixels actually collapsed.
+            yb = ycen_int + row_offset
             yt = yb + xwd - 1
 
             # Check bounds
-            if np.any(yb < 0) or np.any(yt >= nrow):
+            if np.any(yb[cr[0]:cr[1]] < 0) or np.any(yt[cr[0]:cr[1]] >= nrow):
                 continue
 
             # Extract and collapse
@@ -366,7 +366,7 @@ class Curvature:
         """
         n_peaks = len(peaks)
         n_offsets = len(offsets)
-        coeffs = np.zeros((n_peaks, self.curve_degree))
+        coeffs = np.full((n_peaks, self.curve_degree), np.nan)
         residuals = np.full((n_peaks, n_offsets), np.nan)
         min_points = self.curve_degree + 1
 
@@ -414,33 +414,25 @@ class Curvature:
 
         Returns
         -------
-        fitted_coeffs : array of shape (curve_degree, fit_degree + 1) or None
-            Fitted polynomial coefficients for each curvature term, or None on failure.
+        fitted_coeffs : array of shape (curve_degree, fit_degree + 1)
+            Fitted polynomial coefficients for each curvature term.
         peaks : array
             Filtered peak columns
         """
-        try:
-            # Use c1 (linear term) for outlier rejection
-            c1 = coeffs[:, 0] if coeffs.shape[1] > 0 else np.zeros(len(peaks))
-            middle = np.median(c1)
-            sigma = np.percentile(c1, (32, 68))
-            sigma = middle - sigma[0], sigma[1] - middle
-            mask = (c1 >= middle - 5 * sigma[0]) & (c1 <= middle + 5 * sigma[1])
-            peaks = peaks[mask]
-            coeffs = coeffs[mask]
+        # Use c1 (linear term) for outlier rejection
+        c1 = coeffs[:, 0]
+        middle = np.median(c1)
+        sigma = np.percentile(c1, (32, 68))
+        sigma = middle - sigma[0], sigma[1] - middle
+        mask = (c1 >= middle - 5 * sigma[0]) & (c1 <= middle + 5 * sigma[1])
+        peaks = peaks[mask]
+        coeffs = coeffs[mask]
 
-            fitted_coeffs = np.zeros((self.curve_degree, self.fit_degree + 1))
-            for i in range(self.curve_degree):
-                coef_init = np.zeros(self.fit_degree + 1)
-                res = least_squares(
-                    lambda coef, vals=coeffs[:, i]: np.polyval(coef, peaks) - vals,
-                    x0=coef_init,
-                    loss="arctan",
-                )
-                fitted_coeffs[i] = res.x
-
-        except Exception:
-            return None, peaks
+        fitted_coeffs = np.zeros((self.curve_degree, self.fit_degree + 1))
+        for i in range(self.curve_degree):
+            coef_init = np.zeros(self.fit_degree + 1)
+            res = least_squares(lambda coef, vals=coeffs[:, i]: np.polyval(coef, peaks) - vals, x0=coef_init, loss="arctan")
+            fitted_coeffs[i] = res.x
 
         return fitted_coeffs, peaks
 
@@ -531,16 +523,18 @@ class Curvature:
             For 1D mode: shape (n_orders, curve_degree, fit_degree + 1)
             For 2D mode: shape (curve_degree, ...) with polyfit2d coefficients
         """
+        measured = [np.all(np.isfinite(coeffs), axis=1) for coeffs in all_coeffs]
+        peaks = [p[valid] for p, valid in zip(peaks, measured, strict=True)]
+        all_coeffs = [c[valid] for c, valid in zip(all_coeffs, measured, strict=True)]
+        if not any(len(p) for p in peaks):
+            raise ValueError("No measured arc-line positions for slit curvature")
         if self.mode == "1D":
             fitted_coeffs = np.zeros((self.n, self.curve_degree, self.fit_degree + 1))
             for j in range(self.n):
+                if len(peaks[j]) <= self.fit_degree:
+                    raise ValueError(f"No measured slit curvature for trace {j}")
                 result, _ = self._fit_curvature_single_order(peaks[j], all_coeffs[j])
-                if result is None:
-                    logger.warning(
-                        "Could not fit curvature for trace %d, using zero curvature", j
-                    )
-                else:
-                    fitted_coeffs[j] = result
+                fitted_coeffs[j] = result
         elif self.mode == "2D":
             x = np.concatenate(peaks)
             y = [np.full(len(p), i) for i, p in enumerate(peaks)]

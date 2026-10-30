@@ -253,10 +253,9 @@ class TestCurvatureFitFromPositions:
             peaks, positions, offsets
         )
 
-        # Should return zeros when insufficient data
+        # Missing line positions must not become a measured zero tilt.
         assert coeffs.shape == (1, 2)
-        assert coeffs[0, 0] == 0.0
-        assert coeffs[0, 1] == 0.0
+        assert np.all(np.isnan(coeffs))
         # Residuals should be NaN when fit fails
         assert residuals.shape == (1, 2)
         assert np.all(np.isnan(residuals))
@@ -269,8 +268,8 @@ class TestSlitdeltasComputation:
     def simple_orders(self):
         """Simple set of 2 Trace objects."""
         return [
-            Trace(m=0, group=0, pos=np.array([50.0, 0.0]), column_range=(0, 500)),
-            Trace(m=1, group=0, pos=np.array([70.0, 0.0]), column_range=(0, 500)),
+            Trace(m=0, group=0, pos=np.array([50.0]), column_range=(0, 500)),
+            Trace(m=1, group=0, pos=np.array([70.0]), column_range=(0, 500)),
         ]
 
     @pytest.fixture
@@ -420,7 +419,9 @@ class TestSlitdeltasComputation:
         )
 
         nrow, ncol = 100, 500
-        img = np.random.normal(100, 10, (nrow, ncol))
+        x = np.arange(ncol)
+        line = sum(500*np.exp(-.5*((x-centre)/1.2)**2) for centre in (100, 200, 300, 400))
+        img = np.broadcast_to(100 + line, (nrow, ncol)).copy()
 
         result = module.execute(img, compute_slitdeltas=False)
 
@@ -550,3 +551,43 @@ def test_residual_grid_preserves_each_measured_physical_height():
     for i, height in enumerate([40, 10]):
         np.testing.assert_allclose(module.slitdelta_y[i], np.linspace(-height/2, height/2, 41))
         np.testing.assert_allclose(measured[i], .02*module.slitdelta_y[i], atol=1e-15)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("height", [4, 5])
+def test_collapsed_spectra_report_actual_row_centres(height):
+    trace = Trace(m=50, pos=np.array([.5, 20.]), column_range=(10, 40))
+    module = CurvatureModule([trace], extraction_height=height, curve_height=20)
+    module.column_range = np.array([trace.column_range])
+    module.extraction_height = np.array([height])
+    module.curve_height = np.array([20])
+    # Extrapolating this trace to the full image would put it off the detector.
+    image = np.broadcast_to(np.arange(60)[:, None], (60, 150))
+    spectra, offsets = module._extract_offset_spectra(image, 0)
+    centre = int(trace.y_at_x(20))
+    np.testing.assert_allclose(spectra[:, 20], centre + offsets)
+    assert not np.any(spectra.mask[:, 10:40])
+    assert np.all(spectra.mask[:, 40:])
+
+
+@pytest.mark.unit
+def test_joint_rotation_is_measured_even_when_one_order_has_no_lines():
+    traces = [Trace(m=m, pos=np.array([y]), column_range=(0, 500)) for m, y in ((50, 40.), (51, 80.))]
+    module = CurvatureModule(traces, mode="2D", fit_degree=(0, 0), curve_degree=1)
+    peaks = [np.array([100., 250., 400.]), np.empty(0)]
+    coefficients = [np.array([[.105], [.105], [.105]]), np.empty((0, 1))]
+    fitted = module.fit(peaks, coefficients)
+    np.testing.assert_allclose(module.eval(np.array([200., 200.]), np.array([0, 1]), fitted), .105)
+    module = CurvatureModule(traces, mode="1D", fit_degree=0, curve_degree=1)
+    with pytest.raises(ValueError, match="No measured slit curvature for trace 1"):
+        module.fit(peaks, coefficients)
+    with pytest.raises(ValueError, match="No measured arc-line positions"):
+        module.fit([np.empty(0), np.array([200.])], [np.empty((0, 1)), np.array([[np.nan]])])
+
+
+@pytest.mark.unit
+def test_missing_curvature_coefficients_do_not_become_zero_tilt():
+    trace = Trace(m=50, pos=np.array([40.]), column_range=(0, 500))
+    module = CurvatureModule([trace], mode="1D", fit_degree=0, curve_degree=1)
+    with pytest.raises(IndexError):
+        module.fit([np.array([100., 200.])], [np.empty((2, 0))])

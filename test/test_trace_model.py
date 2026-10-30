@@ -613,3 +613,27 @@ def test_residual_coordinates_roundtrip_at_double_precision(tmp_path):
         assert hdus[1].columns['SLITDELTA'].format.endswith('D')
         assert hdus[1].columns['SLITDELTA_Y'].format.endswith('D')
         assert hdus[1].columns['SLITDELTA_Y'].unit == 'pixel'
+
+
+@pytest.mark.parametrize("positions", [(20., 40., 60.), (60., 40., 20.)])
+def test_order_direction_does_not_change_trace_identity(tmp_path, caplog, positions):
+    traces = [Trace(m=m, pos=np.array([y]), column_range=(0, 100)) for m, y in zip((51, 50, 49), positions, strict=True)]
+    path = tmp_path / "trace.fits"
+    save_traces(path, traces)
+    restored, _ = load_traces(path)
+    assert [trace.m for trace in restored] == [51, 50, 49]
+    np.testing.assert_allclose([trace.y_at_x(30) for trace in restored], positions)
+    assert not any("ordering" in record.message for record in caplog.records)
+
+
+def test_crossing_inside_shared_columns_is_reported(tmp_path, caplog):
+    traces = [Trace(m=51, pos=np.array([20.]), column_range=(0, 100)), Trace(m=50, pos=np.array([1., -10.]), column_range=(10, 80))]
+    save_traces(tmp_path / "crossing.fits", traces)
+    assert any("ordering" in record.message for record in caplog.records)
+
+
+
+def test_order_check_does_not_extrapolate_beyond_measured_columns(tmp_path, caplog):
+    traces = [Trace(m=51, pos=np.array([20.]), column_range=(0, 40)), Trace(m=50, pos=np.array([1., -10.]), column_range=(31, 100))]
+    save_traces(tmp_path / "truncated.fits", traces)
+    assert not any("ordering" in record.message for record in caplog.records)

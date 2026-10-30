@@ -26,7 +26,7 @@ def _normal_factor(design, smoothing):
     return factor, penalty, floored, largest
 
 
-def slit_response(image, good, ycen, slitcurve, slitdeltas, slit, osample, lambda_sf, lambda_sp, preset=False):
+def slit_response(image, good, ycen, slitcurve, slitdeltas, slit, osample, lambda_sf, lambda_sp, preset=False, compute_response=True):
     """Return the converged spectrum and its derivative with respect to pixels.
 
     The derivative includes the fitted spatial profile, its normalization and
@@ -64,6 +64,8 @@ def slit_response(image, good, ycen, slitcurve, slitdeltas, slit, osample, lambd
         spectrum = cho_solve_banded((p_factor, True), a.T @ data, check_finite=False)
         supported = np.array(a.multiply(a).sum(axis=0)).ravel() > 0
         if preset:
+            if not compute_response:
+                return spectrum, slit, None
             direct = cho_solve_banded((p_factor, True), a.T.toarray(), check_finite=False)
             direct[~supported] = 0
             return spectrum, slit, direct
@@ -78,6 +80,8 @@ def slit_response(image, good, ycen, slitcurve, slitdeltas, slit, osample, lambd
         next_factor, _, _, _ = _normal_factor(next_a, lambda_sp)
         next_spectrum = cho_solve_banded((next_factor, True), next_a.T @ data, check_finite=False)
         change = np.max(np.abs(next_spectrum-spectrum))
+        if not compute_response and change <= 1e-10 * np.max(np.abs(spectrum)):
+            return spectrum, slit, None
         if iteration >= newton_iterations and change > 1e-10 * np.max(np.abs(spectrum)):
             slit = fixed_slit
             continue

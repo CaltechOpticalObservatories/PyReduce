@@ -45,7 +45,8 @@ try:
 except ImportError:
     console.setFormatter("%(levelname)s - %(message)s")
 
-logger.addHandler(console)
+if not logging.getLogger().hasHandlers():
+    logger.addHandler(console)
 
 del logging
 # do not del tqdm, it is needed in the Log Handler
